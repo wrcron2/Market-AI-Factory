@@ -12,6 +12,26 @@ import (
 	"time"
 )
 
+// FactoryNetwork is the shared Docker network the Factory's own containers
+// (backend, frontend) run on. Every generated product compose file declares
+// it as external and attaches every service to it, so the Factory can reach
+// a product by container name — see the wizard package's remapPublishedPorts.
+const FactoryNetwork = "factory-net"
+
+// EnsureNetwork creates a Docker network if it doesn't already exist —
+// idempotent, safe to call before every deploy. Needed because generated
+// product compose files declare FactoryNetwork as external; nothing else
+// guarantees it exists (e.g. local dev running the backend directly rather
+// than through infra/docker-compose.factory.yml, where the network is
+// normally created implicitly by the Factory's own compose up).
+func EnsureNetwork(name string) error {
+	if _, err := run(10*time.Second, "docker", "network", "inspect", name); err == nil {
+		return nil
+	}
+	_, err := run(10*time.Second, "docker", "network", "create", name)
+	return err
+}
+
 // LsRemoteHead returns the HEAD commit SHA of a remote repo (also proves
 // the repo exists and is reachable without cloning it).
 func LsRemoteHead(repoURL string) (string, error) {

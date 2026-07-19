@@ -8,7 +8,20 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/wrcron2/market-ai-factory/backend/internal/orchestrator"
 )
+
+// FactoryNetwork is the shared Docker network the Factory's own containers
+// run on (infra/docker-compose.factory.yml). Every product service is also
+// attached to it so the Factory can reach the product directly by container
+// name over Docker's internal DNS — no published host port, no cloud
+// firewall rule, works the instant the container starts. Health checks going
+// out over the public internet (and needing an OCI Security List rule per
+// product's port range) was the wrong design; this is the fix. Canonically
+// defined in the orchestrator package, which also knows how to ensure it
+// exists before a deploy.
+const FactoryNetwork = orchestrator.FactoryNetwork
 
 // portMapping describes one published port after remapping.
 type portMapping struct {
@@ -16,6 +29,20 @@ type portMapping struct {
 	ContainerPort string
 	Proto         string
 	NewHostPort   int
+}
+
+// remapResult bundles everything a product's compose file needed changed
+// (ports, network name, container names) plus the fully-rewritten doc.
+type remapResult struct {
+	Mappings       []portMapping
+	ContainerNames map[string]string // service -> assigned container_name
+	NetworkRenamed bool
+	// Overridden lists services where the repo already declared its own
+	// container_name that we replaced — surfaced so the caller can log it;
+	// a peer service or external script referencing the original name would
+	// silently break, since Docker only aliases the name we actually set.
+	Overridden []string
+	Doc        map[string]any
 }
 
 // containerPortRe matches the container-port side of a compose ports: entry,
@@ -38,95 +65,143 @@ func extractContainerPort(entry string) (port, proto string, ok bool) {
 	return m[1], m[2], true
 }
 
-// remapPublishedPorts parses a product's docker-compose.yml, reassigns every
-// published container port to a fresh sequential host port starting at base
-// — deterministically (sorted service names, sorted port entries), since the
-// wizard may re-run this on retry — and renames an explicit top-level
-// `networks.default.name` (if any) to <productSlug>-net. Both are real
-// collisions, not hypothetical: Market-AI's own compose file hardcodes both
-// its ports and its network name ("marketflow-net"), so any product forked
-// from a similarly-shaped repo would otherwise fight over one or the other.
-// Returns the port mappings, whether the network was renamed, and the FULL
-// compose doc with those fields rewritten in place.
+// remapPublishedPorts parses a product's docker-compose.yml and:
+//  1. reassigns every published (string-form) container port to a fresh
+//     sequential host port starting at base — deterministically (sorted
+//     service names, sorted port entries), since the wizard may re-run this
+//     on retry. Long-form (list-of-maps) port entries are preserved
+//     UNCHANGED, never dropped — they aren't remapped, but they must survive;
+//  2. renames an explicit top-level `networks.default.name` (if any) to
+//     <productSlug>-net;
+//  3. gives every service a stable, globally-unique container_name
+//     (<productSlug>-<service>) and attaches it to the shared FactoryNetwork
+//     alongside its own private network.
+//
+// (1) and (2) are real collisions, not hypothetical: Market-AI's own compose
+// file hardcodes both its ports and its network name ("marketflow-net"), so
+// any product forked from a similarly-shaped repo would otherwise fight over
+// one or the other. (3) is what makes the product reachable by the Factory
+// for health checks without a published host port or any cloud firewall
+// rule — internal Docker DNS, live the instant the container starts.
 //
 // The doc is rewritten wholesale (not layered as a docker-compose.override.yml)
 // because compose CONCATENATES `ports:` lists across -f files rather than
 // replacing them — an override wouldn't remove the original colliding
 // binding, only add a second one alongside it.
-func remapPublishedPorts(composeFile string, base int, productSlug string) ([]portMapping, bool, map[string]any, error) {
+func remapPublishedPorts(composeFile string, base int, productSlug string) (*remapResult, error) {
 	raw, err := os.ReadFile(composeFile)
 	if err != nil {
-		return nil, false, nil, fmt.Errorf("read compose file: %w", err)
+		return nil, fmt.Errorf("read compose file: %w", err)
 	}
 	var doc map[string]any
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
-		return nil, false, nil, fmt.Errorf("parse compose file: %w", err)
+		return nil, fmt.Errorf("parse compose file: %w", err)
 	}
 
-	networkRenamed := false
-	if nets, ok := doc["networks"].(map[string]any); ok {
-		if def, ok := nets["default"].(map[string]any); ok {
-			if _, hasName := def["name"]; hasName {
-				def["name"] = productSlug + "-net"
-				nets["default"] = def
-				doc["networks"] = nets
-				networkRenamed = true
-			}
+	res := &remapResult{ContainerNames: map[string]string{}, Doc: doc}
+
+	nets, ok := doc["networks"].(map[string]any)
+	if !ok {
+		nets = map[string]any{}
+	}
+	if def, ok := nets["default"].(map[string]any); ok {
+		if _, hasName := def["name"]; hasName {
+			def["name"] = productSlug + "-net"
+			nets["default"] = def
+			res.NetworkRenamed = true
 		}
 	}
+	nets[FactoryNetwork] = map[string]any{"external": true}
+	doc["networks"] = nets
 
 	services, _ := doc["services"].(map[string]any)
 	if len(services) == 0 {
-		return nil, networkRenamed, doc, nil
+		return res, nil
 	}
 
 	names := make([]string, 0, len(services))
 	for name := range services {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	sort.Strings(names) // determinism — Check() may re-derive this on retry
 
-	var mappings []portMapping
 	next := base
 	for _, name := range names {
 		svc, _ := services[name].(map[string]any)
-		portsRaw, _ := svc["ports"].([]any)
-		if len(portsRaw) == 0 {
-			continue
-		}
-		entries := make([]string, 0, len(portsRaw))
-		for _, p := range portsRaw {
-			if s, ok := p.(string); ok {
-				entries = append(entries, s)
-			}
-		}
-		sort.Strings(entries)
 
-		newEntries := make([]string, 0, len(entries))
-		changed := false
-		for _, entry := range entries {
-			containerPort, proto, ok := extractContainerPort(entry)
-			if !ok {
-				newEntries = append(newEntries, entry)
-				continue
-			}
-			newHost := next
-			next++
-			mappings = append(mappings, portMapping{Service: name, ContainerPort: containerPort, Proto: proto, NewHostPort: newHost})
-			if proto != "" {
-				newEntries = append(newEntries, fmt.Sprintf("%d:%s/%s", newHost, containerPort, proto))
-			} else {
-				newEntries = append(newEntries, fmt.Sprintf("%d:%s", newHost, containerPort))
-			}
-			changed = true
+		if orig, ok := svc["container_name"]; ok && orig != "" {
+			res.Overridden = append(res.Overridden, name)
 		}
-		if changed {
+		containerName := productSlug + "-" + name
+		res.ContainerNames[name] = containerName
+		svc["container_name"] = containerName
+		svc["networks"] = attachFactoryNetwork(svc["networks"])
+
+		portsRaw, _ := svc["ports"].([]any)
+		if len(portsRaw) > 0 {
+			// Long-form entries (list-of-maps, e.g. {target:, published:,
+			// protocol:}) aren't strings — they must be preserved untouched,
+			// never dropped. Only string (short-form) entries are sorted and
+			// candidates for remapping.
+			var stringEntries []string
+			var otherEntries []any
+			for _, p := range portsRaw {
+				if s, ok := p.(string); ok {
+					stringEntries = append(stringEntries, s)
+				} else {
+					otherEntries = append(otherEntries, p)
+				}
+			}
+			sort.Strings(stringEntries)
+
+			newEntries := make([]any, 0, len(stringEntries)+len(otherEntries))
+			for _, entry := range stringEntries {
+				containerPort, proto, ok := extractContainerPort(entry)
+				if !ok {
+					newEntries = append(newEntries, entry)
+					continue
+				}
+				newHost := next
+				next++
+				res.Mappings = append(res.Mappings, portMapping{Service: name, ContainerPort: containerPort, Proto: proto, NewHostPort: newHost})
+				if proto != "" {
+					newEntries = append(newEntries, fmt.Sprintf("%d:%s/%s", newHost, containerPort, proto))
+				} else {
+					newEntries = append(newEntries, fmt.Sprintf("%d:%s", newHost, containerPort))
+				}
+			}
+			newEntries = append(newEntries, otherEntries...)
 			svc["ports"] = newEntries
-			services[name] = svc
 		}
+		services[name] = svc
 	}
 	doc["services"] = services
-	return mappings, networkRenamed, doc, nil
+	return res, nil
+}
+
+// attachFactoryNetwork adds FactoryNetwork to a service's networks list,
+// preserving whatever was there before. Compose service networks may be a
+// plain list of names or a map (name -> per-network settings like aliases);
+// once a service declares an explicit networks: key at all, compose stops
+// implicitly joining "default", so "default" must be added back explicitly
+// when nothing was declared before.
+func attachFactoryNetwork(existing any) any {
+	switch v := existing.(type) {
+	case []any:
+		for _, n := range v {
+			if s, ok := n.(string); ok && s == FactoryNetwork {
+				return v
+			}
+		}
+		return append(v, FactoryNetwork)
+	case map[string]any:
+		if _, ok := v[FactoryNetwork]; !ok {
+			v[FactoryNetwork] = nil
+		}
+		return v
+	default:
+		return []any{"default", FactoryNetwork}
+	}
 }
 
 // writeFactoryCompose writes the fully-resolved, port-remapped doc to
@@ -141,17 +216,20 @@ func writeFactoryCompose(dir string, doc map[string]any) error {
 }
 
 // writePortsInfo writes a human-readable products/<name>/ports.yaml so
-// whoever fills in health_url during onboarding knows which host port each
-// service actually landed on.
-func writePortsInfo(repoRoot, productName string, mappings []portMapping) error {
+// whoever fills in health_url during onboarding knows both addresses: the
+// internal one (works immediately, no firewall) and the host port (for a
+// human hitting it from a browser).
+func writePortsInfo(repoRoot, productName string, mappings []portMapping, containerNames map[string]string) error {
 	dir := repoRoot + "/products/" + productName
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	lines := "# Host ports this product was remapped to, by the deploy step's\n" +
-		"# port-collision fix. container_port -> host_port, per service.\n"
+	lines := "# Addresses this product's services are reachable at, written by the\n" +
+		"# deploy step. internal_url works from inside the Factory network right\n" +
+		"# away (use this for health_url); host_port is for a human's browser.\n"
 	for _, m := range mappings {
-		lines += fmt.Sprintf("%s: {container_port: %s, host_port: %d}\n", m.Service, m.ContainerPort, m.NewHostPort)
+		lines += fmt.Sprintf("%s: {internal_url: \"http://%s:%s\", host_port: %d}\n",
+			m.Service, containerNames[m.Service], m.ContainerPort, m.NewHostPort)
 	}
 	return os.WriteFile(dir+"/ports.yaml", []byte(lines), 0o644)
 }

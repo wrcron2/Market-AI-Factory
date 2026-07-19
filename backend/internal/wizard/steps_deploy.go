@@ -51,36 +51,53 @@ func (Deploy) Execute(ctx *RunContext) error {
 		return nil
 	}
 
-	// Port + network collision fix: the product's own compose file publishes
-	// ports as committed (e.g. a Market-AI-shaped fork reusing :3000/:8080,
-	// or even Market-AI's own ${GO_SERVER_PORT:-8080} env-default syntax) and
-	// may hardcode an explicit network name (Market-AI's is "marketflow-net")
-	// — remap ports into this product's allocated range and rename the
-	// network to <product>-net, into a generated docker-compose.factory.yml,
-	// rather than fighting other products/stacks for the same host port or
-	// Docker network.
+	// Collision + reachability fix, applied to EVERY product unconditionally:
+	// the product's own compose file publishes ports as committed (e.g. a
+	// Market-AI-shaped fork reusing :3000/:8080, or even Market-AI's own
+	// ${GO_SERVER_PORT:-8080} env-default syntax) and may hardcode an
+	// explicit network name (Market-AI's is "marketflow-net") — remap ports
+	// into this product's allocated range and rename the network to
+	// <product>-net. Every service also gets a stable container_name and an
+	// attachment to the shared FactoryNetwork, so the Factory can reach it
+	// by name for health checks with no published port and no cloud
+	// firewall rule required — internal Docker DNS, live immediately.
 	portBase := 10100
 	if v, ok := ctx.State["port_base"].(float64); ok && v > 0 {
 		portBase = int(v)
 	}
-	mappings, networkRenamed, doc, err := remapPublishedPorts(composePath, portBase, ctx.Run.ProductName)
+	remap, err := remapPublishedPorts(composePath, portBase, ctx.Run.ProductName)
 	if err != nil {
 		ctx.State["deploy_error"] = "reading compose file: " + err.Error()
 		return nil
 	}
-	if len(mappings) > 0 || networkRenamed {
-		if err := writeFactoryCompose(dir, doc); err != nil {
-			ctx.State["deploy_error"] = "writing remapped compose file: " + err.Error()
-			return nil
+	if err := writeFactoryCompose(dir, remap.Doc); err != nil {
+		ctx.State["deploy_error"] = "writing remapped compose file: " + err.Error()
+		return nil
+	}
+	if err := writePortsInfo(ctx.RepoRoot, ctx.Run.ProductName, remap.Mappings, remap.ContainerNames); err != nil {
+		ctx.Logger.Warn("deploy.ports_info_write_failed", zap.Error(err))
+	}
+	for _, svc := range remap.Overridden {
+		ctx.Logger.Warn("deploy.container_name_overridden",
+			zap.String("product", ctx.Run.ProductName), zap.String("service", svc),
+			zap.String("hint", "repo declared its own container_name; anything referencing it directly by that name will break"))
+	}
+	portMap := make(map[string]any, len(remap.Mappings))
+	for _, m := range remap.Mappings {
+		portMap[m.Service+":"+m.ContainerPort] = map[string]any{
+			"internal_url": fmt.Sprintf("http://%s:%s", remap.ContainerNames[m.Service], m.ContainerPort),
+			"host_port":    m.NewHostPort,
 		}
-		if err := writePortsInfo(ctx.RepoRoot, ctx.Run.ProductName, mappings); err != nil {
-			ctx.Logger.Warn("deploy.ports_info_write_failed", zap.Error(err))
-		}
-		portMap := make(map[string]any, len(mappings))
-		for _, m := range mappings {
-			portMap[m.Service+":"+m.ContainerPort] = m.NewHostPort
-		}
-		ctx.State["port_map"] = portMap
+	}
+	ctx.State["port_map"] = portMap
+
+	// The generated compose file declares FactoryNetwork as external — it
+	// must exist before compose up, regardless of how the Factory itself
+	// was started (its own docker-compose creates this implicitly, but a
+	// backend run directly, e.g. local dev, would not have).
+	if err := orchestrator.EnsureNetwork(orchestrator.FactoryNetwork); err != nil {
+		ctx.State["deploy_error"] = factoryInfraErrorPrefix + "ensuring " + orchestrator.FactoryNetwork + " network: " + err.Error()
+		return nil
 	}
 
 	if out, err := orchestrator.ComposeUp(dir, orchestrator.ComposeFiles(dir)...); err != nil {
@@ -91,6 +108,11 @@ func (Deploy) Execute(ctx *RunContext) error {
 	ctx.State["deployed"] = true
 	return nil
 }
+
+// factoryInfraErrorPrefix marks a deploy_error as a Factory-side
+// infrastructure problem rather than something wrong with the onboarded
+// repo — Deploy.Check gives it a distinct, non-misleading hint.
+const factoryInfraErrorPrefix = "factory infra: "
 
 func (Deploy) Check(ctx *RunContext) []Issue {
 	if adopted, _ := ctx.State["adopted"].(bool); adopted {
@@ -103,6 +125,10 @@ func (Deploy) Check(ctx *RunContext) []Issue {
 		return nil
 	}
 	if msg, _ := ctx.State["deploy_error"].(string); msg != "" {
+		if rest, isInfra := strings.CutPrefix(msg, factoryInfraErrorPrefix); isInfra {
+			return []Issue{{Code: "factory_infra_error", Message: rest,
+				Hint: "This is a Factory infrastructure problem, not something in your repo — the operator needs to fix it, then Refresh."}}
+		}
 		return []Issue{{Code: "deploy_failed", Message: msg, Hint: "Fix the repo/compose problem, then Refresh."}}
 	}
 	if ok, _ := ctx.State["deployed"].(bool); !ok {
@@ -141,11 +167,12 @@ func (VerifyHealth) Check(ctx *RunContext) []Issue {
 		hint := "Set health_url to this product's liveness endpoint, then Continue."
 		if pm, ok := ctx.State["port_map"].(map[string]any); ok && len(pm) > 0 {
 			parts := make([]string, 0, len(pm))
-			for svc, port := range pm {
-				parts = append(parts, fmt.Sprintf("%s → host port %v", svc, port))
+			for svc, v := range pm {
+				entry, _ := v.(map[string]any)
+				parts = append(parts, fmt.Sprintf("%s → %v (published at host port %v)", svc, entry["internal_url"], entry["host_port"]))
 			}
 			sort.Strings(parts)
-			hint += " This product's services are now published at: " + strings.Join(parts, ", ") + "."
+			hint += " Prefer the internal_url — it works immediately, no firewall rule needed: " + strings.Join(parts, "; ") + "."
 		}
 		return []Issue{{Code: "no_health_url", Message: "no health URL recorded yet", Hint: hint}}
 	}
