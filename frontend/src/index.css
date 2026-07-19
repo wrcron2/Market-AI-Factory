@@ -37,6 +37,9 @@
   .mf-chip {
     @apply rounded px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide;
   }
+  .mf-input {
+    @apply w-full rounded-lg border border-line-soft bg-surface-raised px-2.5 py-2 text-[13px] text-ink outline-none focus:border-signal-blue;
+  }
   .mf-scroll::-webkit-scrollbar {
     width: 10px;
     height: 10px;

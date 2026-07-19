@@ -16,12 +16,36 @@ export function ProductsGrid() {
   const { products } = useOutletContext<{ products: Product[] }>()
   const navigate = useNavigate()
 
+  const hasMarketAI = products.some((p) => p.name === 'market-ai')
+
   return (
     <div>
-      <h1 className="text-[22px] font-semibold tracking-tight">Products</h1>
-      <p className="mb-5 mt-1 text-[13px] text-ink-faint">
-        Live trading agents auto-buying and selling via their own connected Alpaca accounts.
-      </p>
+      <div className="flex items-start justify-between">
+        <div>
+          <h1 className="text-[22px] font-semibold tracking-tight">Products</h1>
+          <p className="mb-5 mt-1 text-[13px] text-ink-faint">
+            Live trading agents auto-buying and selling via their own connected Alpaca accounts.
+          </p>
+        </div>
+        <div className="flex gap-2">
+          {!hasMarketAI && (
+            <button
+              onClick={() =>
+                navigate('/wizard/new?name=market-ai&repo=https://github.com/wrcron2/Market-AI&adopted=1')
+              }
+              className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3.5 py-2 text-[12.5px] font-semibold text-emerald-300"
+            >
+              Onboard Market-AI
+            </button>
+          )}
+          <button
+            onClick={() => navigate('/wizard/new')}
+            className="rounded-lg bg-signal-blue px-3.5 py-2 text-[12.5px] font-semibold text-white"
+          >
+            ＋ Add product
+          </button>
+        </div>
+      </div>
 
       {products.length === 0 && (
         <Card className="p-8 text-center text-[13px] text-ink-faint">

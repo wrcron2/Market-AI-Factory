@@ -13,8 +13,10 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/wrcron2/market-ai-factory/backend/internal/alpaca"
 	"github.com/wrcron2/market-ai-factory/backend/internal/db"
 	"github.com/wrcron2/market-ai-factory/backend/internal/registry"
+	"github.com/wrcron2/market-ai-factory/backend/internal/wizard"
 )
 
 func main() {
@@ -31,6 +33,12 @@ func main() {
 
 	reg := registry.New(database, logger)
 
+	repoRoot := getEnv("FACTORY_REPO_ROOT", ".")
+	workRoot := getEnv("FACTORY_WORK_ROOT", "./product-workdirs")
+	engine := wizard.NewEngine(database, logger, repoRoot, workRoot,
+		wizard.DefaultSteps(alpaca.New()))
+	wiz := wizard.NewHandler(engine, database, logger)
+
 	mux := http.NewServeMux()
 	// Health first — the Market-AI lesson: stats-style endpoints can 500 on an
 	// empty DB, so the Factory ships a dedicated, dependency-free health probe.
@@ -40,6 +48,9 @@ func main() {
 	})
 	mux.HandleFunc("/api/products", reg.Products)
 	mux.HandleFunc("/api/products/", reg.Product)
+	mux.HandleFunc("/api/wizard/steps", wiz.Steps)
+	mux.HandleFunc("/api/wizard/runs", wiz.Runs)
+	mux.HandleFunc("/api/wizard/runs/", wiz.RunByID)
 
 	port := getEnv("FACTORY_PORT", "9080")
 	srv := &http.Server{

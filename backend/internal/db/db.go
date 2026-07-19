@@ -212,14 +212,16 @@ func (d *DB) InsertWizardRun(productName, sourceRepo, firstStep string, stepIDs 
 
 func (d *DB) GetWizardRun(id int64) (*WizardRun, []*WizardStep, error) {
 	var run WizardRun
+	var state string
 	err := d.conn.QueryRow(`
 		SELECT id, product_name, source_repo, current_step, status, state, created_at, updated_at
 		FROM wizard_runs WHERE id = ?`, id).
 		Scan(&run.ID, &run.ProductName, &run.SourceRepo, &run.CurrentStep,
-			&run.Status, &run.State, &run.CreatedAt, &run.UpdatedAt)
+			&run.Status, &state, &run.CreatedAt, &run.UpdatedAt)
 	if err != nil {
 		return nil, nil, err
 	}
+	run.State = json.RawMessage(state)
 	rows, err := d.conn.Query(`
 		SELECT run_id, step_id, seq, status, issues, updated_at
 		FROM wizard_steps WHERE run_id = ? ORDER BY seq ASC`, id)
@@ -230,9 +232,11 @@ func (d *DB) GetWizardRun(id int64) (*WizardRun, []*WizardStep, error) {
 	var steps []*WizardStep
 	for rows.Next() {
 		var s WizardStep
-		if err := rows.Scan(&s.RunID, &s.StepID, &s.Seq, &s.Status, &s.Issues, &s.UpdatedAt); err != nil {
+		var issues string
+		if err := rows.Scan(&s.RunID, &s.StepID, &s.Seq, &s.Status, &issues, &s.UpdatedAt); err != nil {
 			return nil, nil, err
 		}
+		s.Issues = json.RawMessage(issues)
 		steps = append(steps, &s)
 	}
 	return &run, steps, rows.Err()
@@ -249,10 +253,12 @@ func (d *DB) ListWizardRuns() ([]*WizardRun, error) {
 	var out []*WizardRun
 	for rows.Next() {
 		var run WizardRun
+		var state string
 		if err := rows.Scan(&run.ID, &run.ProductName, &run.SourceRepo, &run.CurrentStep,
-			&run.Status, &run.State, &run.CreatedAt, &run.UpdatedAt); err != nil {
+			&run.Status, &state, &run.CreatedAt, &run.UpdatedAt); err != nil {
 			return nil, err
 		}
+		run.State = json.RawMessage(state)
 		out = append(out, &run)
 	}
 	return out, rows.Err()
