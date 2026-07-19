@@ -31,12 +31,13 @@ func main() {
 	defer database.Close()
 	logger.Info("database ready", zap.String("dsn", dsn))
 
-	reg := registry.New(database, logger)
-
 	repoRoot := getEnv("FACTORY_REPO_ROOT", ".")
 	workRoot := getEnv("FACTORY_WORK_ROOT", "./product-workdirs")
+	alpacaClient := alpaca.New()
+	reg := registry.New(database, logger,
+		registry.NewMetricsProvider(repoRoot, alpacaClient, logger))
 	engine := wizard.NewEngine(database, logger, repoRoot, workRoot,
-		wizard.DefaultSteps(alpaca.New()))
+		wizard.DefaultSteps(alpacaClient))
 	wiz := wizard.NewHandler(engine, database, logger)
 
 	mux := http.NewServeMux()

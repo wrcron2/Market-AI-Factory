@@ -14,12 +14,19 @@ import (
 )
 
 type Handler struct {
-	db     *db.DB
-	logger *zap.Logger
+	db      *db.DB
+	logger  *zap.Logger
+	metrics *MetricsProvider
 }
 
-func New(database *db.DB, logger *zap.Logger) *Handler {
-	return &Handler{db: database, logger: logger}
+func New(database *db.DB, logger *zap.Logger, metrics *MetricsProvider) *Handler {
+	return &Handler{db: database, logger: logger, metrics: metrics}
+}
+
+// productView is a Product enriched with live Alpaca metrics for the cards.
+type productView struct {
+	*db.Product
+	Metrics *Metrics `json:"metrics,omitempty"`
 }
 
 // Products handles GET /api/products — the Products grid datasource.
@@ -34,10 +41,11 @@ func (h *Handler) Products(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if products == nil {
-		products = []*db.Product{}
+	views := make([]productView, 0, len(products))
+	for _, p := range products {
+		views = append(views, productView{Product: p, Metrics: h.metrics.For(p)})
 	}
-	writeJSON(w, map[string]any{"products": products})
+	writeJSON(w, map[string]any{"products": views})
 }
 
 // Product handles GET /api/products/{name} — drill-down header data.
@@ -65,7 +73,10 @@ func (h *Handler) Product(w http.ResponseWriter, r *http.Request) {
 	if checks == nil {
 		checks = []*db.ProductCheck{}
 	}
-	writeJSON(w, map[string]any{"product": p, "checks": checks})
+	writeJSON(w, map[string]any{
+		"product": productView{Product: p, Metrics: h.metrics.For(p)},
+		"checks":  checks,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
