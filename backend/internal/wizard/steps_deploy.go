@@ -4,7 +4,11 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
+	"strings"
 	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/wrcron2/market-ai-factory/backend/internal/db"
 	"github.com/wrcron2/market-ai-factory/backend/internal/orchestrator"
@@ -41,12 +45,45 @@ func (Deploy) Execute(ctx *RunContext) error {
 			return nil
 		}
 	}
-	composeFile := "docker-compose.yml"
-	if _, err := os.Stat(dir + "/" + composeFile); err != nil {
+	composePath := dir + "/docker-compose.yml"
+	if _, err := os.Stat(composePath); err != nil {
 		ctx.State["deploy_error"] = "repo has no docker-compose.yml at its root"
 		return nil
 	}
-	if out, err := orchestrator.ComposeUp(dir, composeFile); err != nil {
+
+	// Port + network collision fix: the product's own compose file publishes
+	// ports as committed (e.g. a Market-AI-shaped fork reusing :3000/:8080,
+	// or even Market-AI's own ${GO_SERVER_PORT:-8080} env-default syntax) and
+	// may hardcode an explicit network name (Market-AI's is "marketflow-net")
+	// — remap ports into this product's allocated range and rename the
+	// network to <product>-net, into a generated docker-compose.factory.yml,
+	// rather than fighting other products/stacks for the same host port or
+	// Docker network.
+	portBase := 10100
+	if v, ok := ctx.State["port_base"].(float64); ok && v > 0 {
+		portBase = int(v)
+	}
+	mappings, networkRenamed, doc, err := remapPublishedPorts(composePath, portBase, ctx.Run.ProductName)
+	if err != nil {
+		ctx.State["deploy_error"] = "reading compose file: " + err.Error()
+		return nil
+	}
+	if len(mappings) > 0 || networkRenamed {
+		if err := writeFactoryCompose(dir, doc); err != nil {
+			ctx.State["deploy_error"] = "writing remapped compose file: " + err.Error()
+			return nil
+		}
+		if err := writePortsInfo(ctx.RepoRoot, ctx.Run.ProductName, mappings); err != nil {
+			ctx.Logger.Warn("deploy.ports_info_write_failed", zap.Error(err))
+		}
+		portMap := make(map[string]any, len(mappings))
+		for _, m := range mappings {
+			portMap[m.Service+":"+m.ContainerPort] = m.NewHostPort
+		}
+		ctx.State["port_map"] = portMap
+	}
+
+	if out, err := orchestrator.ComposeUp(dir, orchestrator.ComposeFiles(dir)...); err != nil {
 		ctx.State["deploy_error"] = fmt.Sprintf("%v — %s", err, out)
 		return nil
 	}
@@ -79,16 +116,38 @@ func (Deploy) Check(ctx *RunContext) []Issue {
 
 type VerifyHealth struct{}
 
-func (VerifyHealth) ID() string          { return "verify_health" }
-func (VerifyHealth) Title() string       { return "Verify live health" }
-func (VerifyHealth) NeedsInput() []string { return nil }
+func (VerifyHealth) ID() string    { return "verify_health" }
+func (VerifyHealth) Title() string { return "Verify live health" }
+func (VerifyHealth) NeedsInput() []string {
+	// The deploy step only ever sets health_url on the adopted fast path
+	// (Bug: it silently dropped this for newly-cloned products). This step
+	// is where a new product's health_url actually gets captured.
+	return []string{"health_url", "dashboard_url"}
+}
 
-func (VerifyHealth) Execute(ctx *RunContext) error { return nil } // pure check
+func (VerifyHealth) Execute(ctx *RunContext) error {
+	if u := strings.TrimSpace(ctx.Input["health_url"]); u != "" {
+		ctx.State["health_url"] = u
+	}
+	if u := strings.TrimSpace(ctx.Input["dashboard_url"]); u != "" {
+		ctx.State["dashboard_url"] = u
+	}
+	return nil
+}
 
 func (VerifyHealth) Check(ctx *RunContext) []Issue {
 	url := ctx.StateStr("health_url")
 	if url == "" {
-		return []Issue{{Code: "no_health_url", Message: "no health URL recorded by the deploy step"}}
+		hint := "Set health_url to this product's liveness endpoint, then Continue."
+		if pm, ok := ctx.State["port_map"].(map[string]any); ok && len(pm) > 0 {
+			parts := make([]string, 0, len(pm))
+			for svc, port := range pm {
+				parts = append(parts, fmt.Sprintf("%s → host port %v", svc, port))
+			}
+			sort.Strings(parts)
+			hint += " This product's services are now published at: " + strings.Join(parts, ", ") + "."
+		}
+		return []Issue{{Code: "no_health_url", Message: "no health URL recorded yet", Hint: hint}}
 	}
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(url)

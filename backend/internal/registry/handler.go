@@ -106,12 +106,13 @@ func (h *Handler) pauseResume(w http.ResponseWriter, p *db.Product, action strin
 	}
 	if !p.Adopted && h.workRoot != "" {
 		dir := h.workRoot + "/" + p.Name
+		files := orchestrator.ComposeFiles(dir) // includes the port-remap override, if any
 		var out string
 		var err error
 		if action == "pause" {
-			out, err = orchestrator.ComposeDown(dir, "docker-compose.yml")
+			out, err = orchestrator.ComposeDown(dir, files...)
 		} else {
-			out, err = orchestrator.ComposeUp(dir, "docker-compose.yml")
+			out, err = orchestrator.ComposeUp(dir, files...)
 		}
 		if err != nil {
 			h.logger.Error("registry."+action+"_compose_failed", zap.String("product", p.Name), zap.Error(err))
@@ -144,7 +145,8 @@ func (h *Handler) KillAll(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if !p.Adopted && h.workRoot != "" {
-			if _, err := orchestrator.ComposeDown(h.workRoot+"/"+p.Name, "docker-compose.yml"); err != nil {
+			dir := h.workRoot + "/" + p.Name
+			if _, err := orchestrator.ComposeDown(dir, orchestrator.ComposeFiles(dir)...); err != nil {
 				h.logger.Error("registry.killall_compose_failed", zap.String("product", p.Name), zap.Error(err))
 			}
 		}

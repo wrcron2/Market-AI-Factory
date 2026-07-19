@@ -6,6 +6,7 @@ package orchestrator
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -36,14 +37,38 @@ func CloneAt(repoURL, sha, dir string) error {
 	return nil
 }
 
-// ComposeUp builds and starts the stack defined in dir.
-func ComposeUp(dir, composeFile string) (string, error) {
-	return run(15*time.Minute, "docker-compose", "-f", dir+"/"+composeFile, "up", "-d", "--build")
+// ComposeUp builds and starts the stack defined by the given compose file(s) in dir.
+func ComposeUp(dir string, composeFiles ...string) (string, error) {
+	return run(15*time.Minute, "docker-compose", composeArgs(dir, composeFiles, "up", "-d", "--build")...)
 }
 
-// ComposeDown stops a product stack (kill switch / PAUSE).
-func ComposeDown(dir, composeFile string) (string, error) {
-	return run(5*time.Minute, "docker-compose", "-f", dir+"/"+composeFile, "stop")
+// ComposeDown stops a product stack (kill switch / PAUSE). Must be given the
+// same compose file set as the matching ComposeUp so compose resolves the
+// same project/services.
+func ComposeDown(dir string, composeFiles ...string) (string, error) {
+	return run(5*time.Minute, "docker-compose", composeArgs(dir, composeFiles, "stop")...)
+}
+
+// ComposeFiles returns the compose file to use for a product's stack: the
+// factory-generated, port-remapped file if the deploy step created one (the
+// repo published fixed host ports that needed reassigning to avoid a
+// collision with another product), else the product's own docker-compose.yml,
+// completely unmodified. Never both — compose concatenates `ports:` lists
+// across -f files rather than replacing them, so layering would leave the
+// original colliding binding in place alongside the new one.
+func ComposeFiles(dir string) []string {
+	if _, err := os.Stat(dir + "/docker-compose.factory.yml"); err == nil {
+		return []string{"docker-compose.factory.yml"}
+	}
+	return []string{"docker-compose.yml"}
+}
+
+func composeArgs(dir string, composeFiles []string, cmd ...string) []string {
+	args := make([]string, 0, len(composeFiles)*2+len(cmd))
+	for _, f := range composeFiles {
+		args = append(args, "-f", dir+"/"+f)
+	}
+	return append(args, cmd...)
 }
 
 func run(timeout time.Duration, name string, args ...string) (string, error) {
