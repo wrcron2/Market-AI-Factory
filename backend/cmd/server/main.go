@@ -15,6 +15,7 @@ import (
 
 	"github.com/wrcron2/market-ai-factory/backend/internal/alpaca"
 	"github.com/wrcron2/market-ai-factory/backend/internal/db"
+	"github.com/wrcron2/market-ai-factory/backend/internal/pipeline"
 	"github.com/wrcron2/market-ai-factory/backend/internal/registry"
 	"github.com/wrcron2/market-ai-factory/backend/internal/wizard"
 )
@@ -52,6 +53,15 @@ func main() {
 	mux.HandleFunc("/api/wizard/steps", wiz.Steps)
 	mux.HandleFunc("/api/wizard/runs", wiz.Runs)
 	mux.HandleFunc("/api/wizard/runs/", wiz.RunByID)
+
+	pipelineHandler := pipeline.New(repoRoot, database, logger)
+	mux.HandleFunc("/api/pipeline/repos", pipelineHandler.Repos)
+	mux.HandleFunc("/api/pipeline/status", pipelineHandler.Status)
+	mux.HandleFunc("/api/pipeline/run/scout", pipelineHandler.RunScout)
+	mux.HandleFunc("/api/pipeline/run/research", pipelineHandler.RunResearch)
+	mux.HandleFunc("/api/pipeline/logs", pipelineHandler.Logs)
+	mux.HandleFunc("/api/pipeline/logs/clear", pipelineHandler.ClearLogs)
+	mux.HandleFunc("/api/pipeline/report/{id}", pipelineHandler.Report)
 
 	port := getEnv("FACTORY_PORT", "9080")
 	srv := &http.Server{

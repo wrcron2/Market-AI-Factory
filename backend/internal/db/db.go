@@ -24,6 +24,9 @@ func Open(dsn string) (*DB, error) {
 	if _, err := conn.Exec(schema); err != nil {
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	if _, err := conn.Exec(scoutSchema); err != nil {
+		return nil, fmt.Errorf("apply scout schema: %w", err)
+	}
 	return &DB{conn: conn}, nil
 }
 
