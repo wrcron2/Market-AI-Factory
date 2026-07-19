@@ -1,0 +1,22 @@
+# Secrets — never commit
+.env
+products/*/.env
+
+# Data (SQLite registry + product volumes)
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Build artifacts
+backend/factory-server
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# macOS / IDE
+.DS_Store
+.vscode/
+.idea/
+.claude/settings.local.json
+.claude/worktrees/

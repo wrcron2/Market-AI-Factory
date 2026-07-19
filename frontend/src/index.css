@@ -1,0 +1,61 @@
+/* MarketFlow AI — the single global stylesheet. Imported once in main.tsx. */
+@import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-base text-ink font-sans antialiased;
+  }
+}
+
+/* Standalone keyframes referenced by inline-styled panels (e.g. PipelinePanel). */
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+
+@layer components {
+  .mf-card {
+    @apply rounded-xl border border-line bg-surface;
+  }
+  .mf-pill {
+    @apply inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-1 text-xs;
+  }
+  .mf-chip {
+    @apply rounded px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide;
+  }
+  .mf-scroll::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  .mf-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .mf-scroll::-webkit-scrollbar-thumb {
+    @apply rounded-md;
+    background: #334155;
+    border: 2px solid #0f1117;
+  }
+  .mf-scroll::-webkit-scrollbar-thumb:hover {
+    background: #475569;
+  }
+}
+
+@layer utilities {
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
