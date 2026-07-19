@@ -11,16 +11,18 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/wrcron2/market-ai-factory/backend/internal/db"
+	"github.com/wrcron2/market-ai-factory/backend/internal/orchestrator"
 )
 
 type Handler struct {
-	db      *db.DB
-	logger  *zap.Logger
-	metrics *MetricsProvider
+	db       *db.DB
+	logger   *zap.Logger
+	metrics  *MetricsProvider
+	workRoot string // where non-adopted product stacks live (compose dirs)
 }
 
-func New(database *db.DB, logger *zap.Logger, metrics *MetricsProvider) *Handler {
-	return &Handler{db: database, logger: logger, metrics: metrics}
+func New(database *db.DB, logger *zap.Logger, metrics *MetricsProvider, workRoot string) *Handler {
+	return &Handler{db: database, logger: logger, metrics: metrics, workRoot: workRoot}
 }
 
 // productView is a Product enriched with live Alpaca metrics for the cards.
@@ -48,14 +50,16 @@ func (h *Handler) Products(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"products": views})
 }
 
-// Product handles GET /api/products/{name} — drill-down header data.
+// Product routes /api/products/{name}[/pause|/resume] — drill-down data and
+// the per-product kill switch.
 func (h *Handler) Product(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+	rest := strings.TrimPrefix(r.URL.Path, "/api/products/")
+	parts := strings.SplitN(rest, "/", 2)
+	name := parts[0]
+	action := ""
+	if len(parts) == 2 {
+		action = parts[1]
 	}
-	name := strings.TrimPrefix(r.URL.Path, "/api/products/")
-	name = strings.SplitN(name, "/", 2)[0]
 	if name == "" {
 		http.Error(w, "product name required", http.StatusBadRequest)
 		return
@@ -65,18 +69,96 @@ func (h *Handler) Product(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "product not found", http.StatusNotFound)
 		return
 	}
-	checks, err := h.db.ListProductChecks(p.ID, 24)
+
+	switch {
+	case action == "" && r.Method == http.MethodGet:
+		checks, err := h.db.ListProductChecks(p.ID, 24)
+		if err != nil {
+			h.logger.Error("registry.checks_failed", zap.String("product", name), zap.Error(err))
+		}
+		if checks == nil {
+			checks = []*db.ProductCheck{}
+		}
+		report, reportAt := h.db.LatestAIReport(p.ID)
+		writeJSON(w, map[string]any{
+			"product":      productView{Product: p, Metrics: h.metrics.For(p)},
+			"checks":       checks,
+			"ai_report":    report,
+			"ai_report_at": reportAt,
+		})
+
+	case (action == "pause" || action == "resume") && r.Method == http.MethodPost:
+		h.pauseResume(w, p, action)
+
+	default:
+		http.Error(w, "not found", http.StatusNotFound)
+	}
+}
+
+// pauseResume flips trading state. Non-adopted products also get their
+// compose stack stopped/started; adopted products (their deploy predates the
+// factory) only change registry status — the factory must never knock over
+// a stack it doesn't own.
+func (h *Handler) pauseResume(w http.ResponseWriter, p *db.Product, action string) {
+	target := db.StatusPaused
+	if action == "resume" {
+		target = db.StatusLive
+	}
+	if !p.Adopted && h.workRoot != "" {
+		dir := h.workRoot + "/" + p.Name
+		var out string
+		var err error
+		if action == "pause" {
+			out, err = orchestrator.ComposeDown(dir, "docker-compose.yml")
+		} else {
+			out, err = orchestrator.ComposeUp(dir, "docker-compose.yml")
+		}
+		if err != nil {
+			h.logger.Error("registry."+action+"_compose_failed", zap.String("product", p.Name), zap.Error(err))
+			http.Error(w, "compose "+action+" failed: "+out, http.StatusInternalServerError)
+			return
+		}
+	}
+	if err := h.db.UpdateProductStatus(p.Name, target); err != nil {
+		h.fail(w, action, err)
+		return
+	}
+	h.logger.Info("registry.product_"+action, zap.String("product", p.Name))
+	writeJSON(w, map[string]any{"name": p.Name, "status": target})
+}
+
+// KillAll handles POST /api/killall — pauses every LIVE product.
+func (h *Handler) KillAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	products, err := h.db.ListProducts()
 	if err != nil {
-		h.logger.Error("registry.checks_failed", zap.String("product", name), zap.Error(err))
-		checks = nil
+		h.fail(w, "killall", err)
+		return
 	}
-	if checks == nil {
-		checks = []*db.ProductCheck{}
+	paused := []string{}
+	for _, p := range products {
+		if p.Status != db.StatusLive {
+			continue
+		}
+		if !p.Adopted && h.workRoot != "" {
+			if _, err := orchestrator.ComposeDown(h.workRoot+"/"+p.Name, "docker-compose.yml"); err != nil {
+				h.logger.Error("registry.killall_compose_failed", zap.String("product", p.Name), zap.Error(err))
+			}
+		}
+		if err := h.db.UpdateProductStatus(p.Name, db.StatusPaused); err == nil {
+			paused = append(paused, p.Name)
+		}
 	}
-	writeJSON(w, map[string]any{
-		"product": productView{Product: p, Metrics: h.metrics.For(p)},
-		"checks":  checks,
-	})
+	h.logger.Warn("registry.killall", zap.Strings("paused", paused))
+	writeJSON(w, map[string]any{"paused": paused})
+}
+
+func (h *Handler) fail(w http.ResponseWriter, op string, err error) {
+	h.logger.Error("registry."+op+"_failed", zap.Error(err))
+	http.Error(w, "internal error", http.StatusInternalServerError)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

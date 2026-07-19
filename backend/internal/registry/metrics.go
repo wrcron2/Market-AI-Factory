@@ -96,10 +96,14 @@ func (mp *MetricsProvider) stale(name string) *Metrics {
 	return nil
 }
 
-// readCreds parses ALPACA_API_KEY / ALPACA_SECRET_KEY from the product's env
-// file. The secret never leaves this process — metrics only.
 func (mp *MetricsProvider) readCreds(name string) (keyID, secret string) {
-	f, err := os.Open(mp.repoRoot + "/products/" + name + "/.env")
+	return ReadProductCreds(mp.repoRoot, name)
+}
+
+// ReadProductCreds parses ALPACA_API_KEY / ALPACA_SECRET_KEY from a product's
+// env file. The secret never leaves this process — metrics and monitoring only.
+func ReadProductCreds(repoRoot, name string) (keyID, secret string) {
+	f, err := os.Open(repoRoot + "/products/" + name + "/.env")
 	if err != nil {
 		return "", ""
 	}

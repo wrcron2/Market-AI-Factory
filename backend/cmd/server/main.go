@@ -15,6 +15,8 @@ import (
 
 	"github.com/wrcron2/market-ai-factory/backend/internal/alpaca"
 	"github.com/wrcron2/market-ai-factory/backend/internal/db"
+	"github.com/wrcron2/market-ai-factory/backend/internal/llm"
+	"github.com/wrcron2/market-ai-factory/backend/internal/monitor"
 	"github.com/wrcron2/market-ai-factory/backend/internal/pipeline"
 	"github.com/wrcron2/market-ai-factory/backend/internal/registry"
 	"github.com/wrcron2/market-ai-factory/backend/internal/wizard"
@@ -36,10 +38,14 @@ func main() {
 	workRoot := getEnv("FACTORY_WORK_ROOT", "./product-workdirs")
 	alpacaClient := alpaca.New()
 	reg := registry.New(database, logger,
-		registry.NewMetricsProvider(repoRoot, alpacaClient, logger))
+		registry.NewMetricsProvider(repoRoot, alpacaClient, logger), workRoot)
 	engine := wizard.NewEngine(database, logger, repoRoot, workRoot,
 		wizard.DefaultSteps(alpacaClient))
 	wiz := wizard.NewHandler(engine, database, logger)
+
+	// Each product's ops team: 2h deterministic checks + daily AI review.
+	mon := monitor.New(database, logger, alpacaClient, llm.New(), repoRoot)
+	mon.Start()
 
 	mux := http.NewServeMux()
 	// Health first — the Market-AI lesson: stats-style endpoints can 500 on an
@@ -50,6 +56,7 @@ func main() {
 	})
 	mux.HandleFunc("/api/products", reg.Products)
 	mux.HandleFunc("/api/products/", reg.Product)
+	mux.HandleFunc("/api/killall", reg.KillAll)
 	mux.HandleFunc("/api/wizard/steps", wiz.Steps)
 	mux.HandleFunc("/api/wizard/runs", wiz.Runs)
 	mux.HandleFunc("/api/wizard/runs/", wiz.RunByID)
