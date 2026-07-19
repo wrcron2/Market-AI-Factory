@@ -87,6 +87,18 @@ func (h *Handler) Product(w http.ResponseWriter, r *http.Request) {
 			"ai_report_at": reportAt,
 		})
 
+	case action == "proxy" || strings.HasPrefix(action, "proxy/"):
+		// Dashboard reverse-proxy — see proxy.go. r.URL.Path is
+		// already in the canonical /api/products/<name>/proxy/<rest>
+		// shape here (this handler only trimmed the prefix into the
+		// local `rest` var, not into r.URL.Path itself), so ServeProxy
+		// can re-derive it from the request as written. Branching here
+		// (rather than registering a separate mux route) keeps
+		// /api/products/{name}[/action] under one path-dispatch site
+		// where order is obvious — pause/resume and proxy share the
+		// same <name> lookup, which "product not found" expects.
+		h.ServeProxy(w, r)
+
 	case (action == "pause" || action == "resume") && r.Method == http.MethodPost:
 		h.pauseResume(w, p, action)
 

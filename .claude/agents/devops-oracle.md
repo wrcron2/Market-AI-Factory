@@ -65,6 +65,25 @@ misbehaves, roll back first, diagnose second — the market doesn't wait.
   `/api/orders/pending` (NOT `/api/stats` — 500s on empty DB), check
   `sudo docker logs` for crash loops.
 
+## Factory product dashboards — NO per-product OCI Security List rules needed
+- Product dashboards are proxied through the Factory's own port 9000:
+  `http://129.159.146.157:9000/products/<name>/dashboard` → backend
+  reverse-proxy at `/api/products/<name>/proxy/*` → product's internal
+  container URL over `factory-net` Docker DNS. Zero cloud-layer edits per
+  product, ever.
+- The product port range (10100-19999) iptables rule on the VM is still
+  needed for the docker-proxy DNAT to work *locally* (host-loopback curl),
+  but the OCI Security List / NSG in the Oracle Console does NOT need to
+  open 10100-19999 for external browser access — browsers hit port 9000
+  (already open) and the Factory routes internally.
+- Only ports 9000 (Factory frontend), 9080 (Factory backend), 3000
+  (Market-AI adopted frontend), and 8080 (Market-AI adopted backend) need
+  OCI Security List ingress rules for external access. New products
+  onboarded through the wizard get NO published-port cloud exposure —
+  their dashboards are reachable ONLY through the Factory proxy.
+- If a product's raw URL ever needs direct browser access (debugging),
+  open a temporary OCI rule for its specific port, use it, then close it.
+
 ## Boundaries
 - Code must already be on main — never push yourself.
 - Destructive server ops (volume/db deletion, key rotation) require explicit

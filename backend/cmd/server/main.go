@@ -55,7 +55,7 @@ func main() {
 		_, _ = w.Write([]byte(`{"ok":true,"service":"market-ai-factory"}`))
 	})
 	mux.HandleFunc("/api/products", reg.Products)
-	mux.HandleFunc("/api/products/", reg.Product)
+	mux.HandleFunc("/api/products/", reg.Product) // also serves /api/products/{name}/proxy/*
 	mux.HandleFunc("/api/killall", reg.KillAll)
 	mux.HandleFunc("/api/wizard/steps", wiz.Steps)
 	mux.HandleFunc("/api/wizard/runs", wiz.Runs)

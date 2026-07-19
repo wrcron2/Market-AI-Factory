@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
-import { useParams } from 'react-router-dom'
-import { ExternalLink, Pause, Play, Sparkles } from 'lucide-react'
+import { useNavigate, useParams } from 'react-router-dom'
+import { ExternalLink, LayoutDashboard, Pause, Play, Sparkles } from 'lucide-react'
 import type { Product, ProductCheck } from '../types'
 import { fmtUSD } from '../lib/format'
 import { Card } from './ui/primitives'
@@ -10,6 +10,7 @@ import { Card } from './ui/primitives'
  *  stats) and P5 (AI monitor reports, kill switch). */
 export function ProductDetail() {
   const { name } = useParams<{ name: string }>()
+  const navigate = useNavigate()
   const [product, setProduct] = useState<Product | null>(null)
   const [checks, setChecks] = useState<ProductCheck[]>([])
   const [aiReport, setAiReport] = useState<{ text: string; at: string } | null>(null)
@@ -71,13 +72,22 @@ export function ProductDetail() {
           </button>
         ) : null}
         {product.dashboard_url && (
+          <button
+            onClick={() => navigate(`/products/${name}/dashboard`)}
+            className="flex items-center gap-1.5 rounded-lg border border-signal-blue/40 bg-signal-blue/10 px-3 py-1.5 text-[12.5px] text-blue-200 hover:bg-signal-blue/20"
+          >
+            <LayoutDashboard size={13} /> Open dashboard
+          </button>
+        )}
+        {product.dashboard_url && (
           <a
             href={product.dashboard_url}
             target="_blank"
             rel="noreferrer"
             className="flex items-center gap-1.5 rounded-lg border border-line-soft bg-surface-raised px-3 py-1.5 text-[12.5px] text-ink-muted hover:text-ink"
+            title="Open the product's raw URL in a new tab — usually only reachable from inside the host network"
           >
-            Open product dashboard <ExternalLink size={13} />
+            <ExternalLink size={13} /> Direct URL
           </a>
         )}
       </div>
