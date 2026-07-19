@@ -165,10 +165,11 @@ func scanProduct(r rowScanner) (*Product, error) {
 // ─── Wizard runs ─────────────────────────────────────────────────────────────
 
 const (
-	RunRunning = "running"
-	RunBlocked = "blocked" // current step has issues; waiting for fix + Refresh
-	RunDone    = "done"
-	RunFailed  = "failed"
+	RunRunning   = "running"
+	RunBlocked   = "blocked" // current step has issues; waiting for fix + Refresh
+	RunDone      = "done"
+	RunFailed    = "failed"
+	RunCancelled = "cancelled" // user abandoned the run; nothing published
 )
 
 type WizardRun struct {

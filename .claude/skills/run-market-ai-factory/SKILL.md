@@ -32,6 +32,34 @@ cd frontend && npm install && npm run dev    # → http://localhost:9000
 Health probe: `curl localhost:9080/api/health` → `{"ok":true,...}` (dedicated
 endpoint — never depends on DB contents).
 
+## Drive the UI as a user (ui.mjs — REQUIRED for user-facing changes)
+
+curl verifies APIs; it does not verify features. The wizard once shipped a
+permanently-stuck-run bug that any 30-second UI walk would have caught. So:
+any change a user sees gets walked with the CDP driver before it ships —
+including one wrong input, one Back, and one Cancel.
+
+```bash
+UIDRV=.claude/skills/run-market-ai-factory/ui.mjs
+node $UIDRV start                                  # headless Chrome on :9333
+node $UIDRV goto  "http://localhost:9000/wizard/new"
+node $UIDRV type  'input[placeholder="market-ai"]' "OpenAlice"   # → normalized to "openalice"
+node $UIDRV clickText "Start onboarding"           # accepts confirm() dialogs too
+node $UIDRV clickText "Continue"
+node $UIDRV clickText "Back"
+node $UIDRV clickText "Cancel run"                 # walks through the confirm
+node $UIDRV text  ".grid > div:nth-child(2) .text-\\[15px\\]"    # read active step
+node $UIDRV eval  "location.pathname"
+node $UIDRV shot  /tmp/walk.png                    # LOOK at it
+node $UIDRV stop
+```
+
+No dependencies — Node ≥21 built-ins only (fetch + WebSocket over the
+DevTools Protocol). `type` uses the native value setter + input event so
+React onChange fires. `click`/`clickText` auto-accept `window.confirm`
+(headless Chrome silently REJECTS dialogs otherwise — a Cancel-style flow
+would look like a dead button).
+
 ## Screenshot (headless Chrome)
 
 ```bash

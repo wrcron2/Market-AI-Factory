@@ -1,6 +1,7 @@
 package wizard
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -110,6 +111,122 @@ func TestBlockedStepStoresIssuesAndRefreshUnblocks(t *testing.T) {
 	run, _, _ = d.GetWizardRun(id)
 	if run.Status != db.RunDone {
 		t.Fatalf("want done, got %s", run.Status)
+	}
+}
+
+func TestStartRunRejectsInvalidName(t *testing.T) {
+	e, _ := newTestEngine(t, []Step{okStep{"a"}})
+	if _, err := e.StartRun("OpenAlice", "https://github.com/x/y", false); err == nil {
+		t.Fatal("expected StartRun to reject an uppercase name — this is the OpenAlice bug")
+	} else if want := `"openalice"`; !contains(err.Error(), want) {
+		t.Fatalf("error should suggest the corrected slug %s, got: %v", want, err)
+	}
+}
+
+func TestBackReturnsToPreviousStepAndReExecutes(t *testing.T) {
+	e, d := newTestEngine(t, []Step{okStep{"a"}, gateStep{"gate"}, okStep{"z"}})
+	id, _ := e.StartRun("prod", "https://github.com/x/y", false)
+	_ = e.Advance(id, nil) // a → ok
+	_ = e.Advance(id, nil) // gate blocks
+
+	if err := e.Back(id); err != nil {
+		t.Fatalf("back: %v", err)
+	}
+	run, steps, _ := d.GetWizardRun(id)
+	if run.CurrentStep != "a" || run.Status != db.RunRunning {
+		t.Fatalf("want running@a after back, got %s@%s", run.Status, run.CurrentStep)
+	}
+	for _, s := range steps {
+		if (s.StepID == "a" || s.StepID == "gate") && s.Status != "pending" {
+			t.Fatalf("step %s should be reset to pending, got %s", s.StepID, s.Status)
+		}
+	}
+	// The run must be fully replayable forward again.
+	_ = e.Advance(id, nil)                             // a → ok
+	_ = e.Advance(id, map[string]string{"fixed": "yes"}) // gate → ok
+	_ = e.Advance(id, nil)                             // z → ok
+	run, _, _ = d.GetWizardRun(id)
+	if run.Status != db.RunDone {
+		t.Fatalf("want done after replay, got %s", run.Status)
+	}
+
+	// Back is refused at the first step and after completion.
+	id2, _ := e.StartRun("prod2", "https://github.com/x/y", false)
+	if err := e.Back(id2); err == nil {
+		t.Fatal("back at first step should error")
+	}
+	if err := e.Back(id); err == nil {
+		t.Fatal("back on a done run should error")
+	}
+}
+
+func TestCancelStopsRunAndBlocksFurtherAdvance(t *testing.T) {
+	e, d := newTestEngine(t, []Step{okStep{"a"}, gateStep{"gate"}})
+	id, _ := e.StartRun("prod", "https://github.com/x/y", false)
+	_ = e.Advance(id, nil)
+
+	if err := e.Cancel(id); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	run, _, _ := d.GetWizardRun(id)
+	if run.Status != db.RunCancelled {
+		t.Fatalf("want cancelled, got %s", run.Status)
+	}
+	if err := e.Cancel(id); err != nil {
+		t.Fatalf("cancel must be idempotent, got: %v", err)
+	}
+	if err := e.Advance(id, nil); err == nil {
+		t.Fatal("advance on a cancelled run should error")
+	}
+	if err := e.Back(id); err == nil {
+		t.Fatal("back on a cancelled run should error")
+	}
+}
+
+func TestCancelNeverDeletesARegisteredProductsDir(t *testing.T) {
+	e, d := newTestEngine(t, []Step{okStep{"a"}})
+	id, _ := e.StartRun("prod", "https://github.com/x/y", false)
+
+	// Product exists in the registry AND on disk — cancel must leave the dir.
+	if _, err := d.InsertProduct(&db.Product{Name: "prod", DisplayName: "prod", SourceRepo: "x", Status: db.StatusLive}); err != nil {
+		t.Fatalf("insert product: %v", err)
+	}
+	dir := filepath.Join(e.repoRoot, "products", "prod")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("SECRET"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Cancel(id); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".env")); err != nil {
+		t.Fatal("cancel deleted a REGISTERED product's dir — capital-critical secrets lost")
+	}
+}
+
+func TestCancelSkipsCleanupForPathTraversalLegacyName(t *testing.T) {
+	e, d := newTestEngine(t, []Step{okStep{"a"}})
+	// Legacy runs predate StartRun validation — insert directly with a
+	// traversal name, the way an old DB row could look.
+	id, err := d.InsertWizardRun("../escape", "https://github.com/x/y", "a", []string{"a"})
+	if err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	victim := filepath.Join(e.repoRoot, "escape")
+	if err := os.MkdirAll(victim, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(victim, "marker")
+	if err := os.WriteFile(marker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Cancel(id); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatal("cancel followed a path-traversal product name outside products/")
 	}
 }
 

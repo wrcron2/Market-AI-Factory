@@ -67,7 +67,12 @@ func (CreateSpace) Execute(ctx *RunContext) error {
 	}
 	adopted, _ := ctx.State["adopted"].(bool)
 	portBase := 0
-	if !adopted {
+	if existing, ok := ctx.State["port_base"].(float64); ok && existing > 0 {
+		// Re-execution after Back must keep the original allocation — a
+		// fresh MaxPortBase() here would silently move the product's ports
+		// out from under URLs captured in later steps.
+		portBase = int(existing)
+	} else if !adopted {
 		maxBase, err := ctx.DB.MaxPortBase()
 		if err != nil {
 			return fmt.Errorf("port allocation: %w", err)

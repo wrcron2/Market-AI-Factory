@@ -63,6 +63,10 @@ func (h *Handler) Runs(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "product_name and source_repo are required", http.StatusBadRequest)
 			return
 		}
+		if err := ValidateProductName(req.ProductName); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		id, err := h.engine.StartRun(req.ProductName, req.SourceRepo, req.Adopted)
 		if err != nil {
 			h.fail(w, "start run", err)
@@ -97,14 +101,19 @@ func (h *Handler) RunByID(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, map[string]any{"run": run, "steps": steps})
 
-	case (action == "advance" || action == "refresh") && r.Method == http.MethodPost:
+	case (action == "advance" || action == "refresh" || action == "back" || action == "cancel") && r.Method == http.MethodPost:
 		input := map[string]string{}
 		_ = json.NewDecoder(r.Body).Decode(&input) // empty body is fine
 		var opErr error
-		if action == "advance" {
+		switch action {
+		case "advance":
 			opErr = h.engine.Advance(id, input)
-		} else {
+		case "refresh":
 			opErr = h.engine.Refresh(id, input)
+		case "back":
+			opErr = h.engine.Back(id)
+		case "cancel":
+			opErr = h.engine.Cancel(id)
 		}
 		if opErr != nil {
 			h.fail(w, action, opErr)

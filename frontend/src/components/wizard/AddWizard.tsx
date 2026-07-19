@@ -1,7 +1,19 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { Check, CircleAlert, LoaderCircle, RefreshCw } from 'lucide-react'
+import { ArrowLeft, Ban, Check, CircleAlert, LoaderCircle, RefreshCw } from 'lucide-react'
 import { Card } from '../ui/primitives'
+
+/** Mirror of the backend's SuggestSlug: makes an invalid product name
+ *  impossible to type in the first place (lowercase, digits, dashes). */
+function normalizeSlug(input: string): string {
+  return input
+    .toLowerCase()
+    .replace(/[ _.]/g, '-')
+    .replace(/[^a-z0-9-]/g, '')
+    .replace(/-+/g, '-')
+    .replace(/^-+/, '')
+    .slice(0, 41)
+}
 
 interface StepMeta {
   id: string
@@ -19,7 +31,7 @@ interface Run {
   product_name: string
   source_repo: string
   current_step: string
-  status: 'running' | 'blocked' | 'done' | 'failed'
+  status: 'running' | 'blocked' | 'done' | 'failed' | 'cancelled'
 }
 
 const INPUT_LABELS: Record<string, { label: string; secret?: boolean; placeholder?: string }> = {
@@ -34,7 +46,7 @@ const INPUT_LABELS: Record<string, { label: string; secret?: boolean; placeholde
  *  dedicated "Onboard Market-AI" button uses. */
 export function WizardStart() {
   const [params] = useSearchParams()
-  const [name, setName] = useState(params.get('name') ?? '')
+  const [name, setName] = useState(normalizeSlug(params.get('name') ?? ''))
   const [repo, setRepo] = useState(params.get('repo') ?? '')
   const adopted = params.get('adopted') === '1'
   const [error, setError] = useState<string | null>(null)
@@ -42,11 +54,15 @@ export function WizardStart() {
 
   const start = async () => {
     setError(null)
+    // Trailing dashes are allowed while typing ("market-" en route to
+    // "market-ai") but trimmed at submit, matching the backend's SuggestSlug.
+    const finalName = name.replace(/-+$/, '')
+    setName(finalName)
     try {
       const res = await fetch('/api/wizard/runs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ product_name: name.trim(), source_repo: repo.trim(), adopted }),
+        body: JSON.stringify({ product_name: finalName, source_repo: repo.trim(), adopted }),
       })
       if (!res.ok) throw new Error(await res.text())
       const data = await res.json()
@@ -64,15 +80,18 @@ export function WizardStart() {
       </p>
       <Card className="flex flex-col gap-3 p-[18px]">
         <Field label="Product name (slug)">
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="market-ai"
+          <input value={name} onChange={(e) => setName(normalizeSlug(e.target.value))} placeholder="market-ai"
             className="mf-input" />
+          <span className="mt-1 text-[11px] text-ink-faint">
+            Lowercase letters, digits, and dashes (min 2 chars) — typed input is normalized automatically.
+          </span>
         </Field>
         <Field label="Source repo URL">
           <input value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="https://github.com/owner/repo"
             className="mf-input" />
         </Field>
         {error && <div className="text-[12.5px] text-red-400">{error}</div>}
-        <button onClick={start} disabled={!name.trim() || !repo.trim()}
+        <button onClick={start} disabled={name.replace(/-+$/, '').length < 2 || !repo.trim()}
           className="mt-1 self-start rounded-lg bg-signal-blue px-4 py-2 text-[13px] font-semibold text-white disabled:opacity-40">
           Start onboarding
         </button>
@@ -90,6 +109,7 @@ export function WizardRun() {
   const [steps, setSteps] = useState<RunStep[]>([])
   const [inputs, setInputs] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState(false)
+  const [actionError, setActionError] = useState<string | null>(null)
   const navigate = useNavigate()
 
   const load = useCallback(async () => {
@@ -108,20 +128,28 @@ export function WizardRun() {
     load()
   }, [load])
 
-  const act = async (action: 'advance' | 'refresh') => {
+  const act = async (action: 'advance' | 'refresh' | 'back' | 'cancel') => {
+    if (action === 'cancel' && !window.confirm('Cancel this onboarding? Anything provisioned so far (product space, stored Alpaca keys) is cleaned up.')) {
+      return
+    }
     setBusy(true)
+    setActionError(null)
     try {
       const res = await fetch(`/api/wizard/runs/${runId}/${action}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(inputs),
       })
-      if (res.ok) {
-        const data = await res.json()
-        setRun(data.run)
-        setSteps(data.steps ?? [])
-        setInputs({})
+      if (!res.ok) {
+        setActionError(`${action} failed: ${await res.text()}`)
+        return
       }
+      const data = await res.json()
+      setRun(data.run)
+      setSteps(data.steps ?? [])
+      setInputs({})
+    } catch (e) {
+      setActionError(`${action} failed: ${e instanceof Error ? e.message : 'network error'}`)
     } finally {
       setBusy(false)
     }
@@ -132,12 +160,22 @@ export function WizardRun() {
   const currentMeta = meta.find((m) => m.id === run.current_step)
   const currentStep = steps.find((s) => s.step_id === run.current_step)
   const issues = currentStep?.issues ?? []
+  const stepIndex = meta.findIndex((m) => m.id === run.current_step)
+  const canGoBack = stepIndex > 0 && run.status !== 'done' && run.status !== 'cancelled'
 
   return (
     <div>
-      <h1 className="font-mono text-[20px] font-semibold tracking-tight">
-        Onboarding · {run.product_name}
-      </h1>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h1 className="font-mono text-[20px] font-semibold tracking-tight">
+          Onboarding · {run.product_name}
+        </h1>
+        {run.status !== 'done' && run.status !== 'cancelled' && (
+          <button onClick={() => act('cancel')} disabled={busy}
+            className="flex items-center gap-1.5 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[12.5px] font-semibold text-red-300 disabled:opacity-40">
+            <Ban size={13} /> Cancel run
+          </button>
+        )}
+      </div>
       <p className="mb-5 mt-1 text-[12.5px] text-ink-faint">{run.source_repo}</p>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[280px_1fr]">
@@ -159,7 +197,27 @@ export function WizardRun() {
 
         {/* Current hangar */}
         <Card className="p-[18px]">
-          {run.status === 'done' ? (
+          {run.status === 'cancelled' ? (
+            <div>
+              <div className="mb-1 flex items-center gap-2 text-[15px] font-semibold text-ink-muted">
+                <Ban size={16} /> Run cancelled
+              </div>
+              <p className="mb-4 text-[13px] text-ink-faint">
+                Nothing was published; the product space and any stored keys were cleaned up.
+              </p>
+              <div className="flex gap-2.5">
+                <button
+                  onClick={() => navigate(`/wizard/new?name=${encodeURIComponent(run.product_name)}&repo=${encodeURIComponent(run.source_repo)}`)}
+                  className="rounded-lg bg-signal-blue px-4 py-2 text-[13px] font-semibold text-white">
+                  Start over
+                </button>
+                <button onClick={() => navigate('/products')}
+                  className="rounded-lg border border-line-soft bg-surface-raised px-4 py-2 text-[13px] text-ink-muted">
+                  Back to products
+                </button>
+              </div>
+            </div>
+          ) : run.status === 'done' ? (
             <div>
               <div className="mb-1 flex items-center gap-2 text-[15px] font-semibold text-emerald-400">
                 <Check size={16} /> Product published
@@ -209,7 +267,18 @@ export function WizardRun() {
                 </div>
               )}
 
-              <div className="flex items-center gap-2.5">
+              {actionError && (
+                <div className="mb-3 rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-[12.5px] text-red-200">
+                  {actionError}
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center gap-2.5">
+                <button onClick={() => act('back')} disabled={busy || !canGoBack}
+                  title={canGoBack ? 'Return to the previous step to change its inputs' : 'Already at the first step'}
+                  className="flex items-center gap-2 rounded-lg border border-line-soft bg-surface-raised px-4 py-2 text-[13px] text-ink-muted disabled:opacity-40">
+                  <ArrowLeft size={13} /> Back
+                </button>
                 <button onClick={() => act('advance')} disabled={busy}
                   className="flex items-center gap-2 rounded-lg bg-signal-blue px-4 py-2 text-[13px] font-semibold text-white disabled:opacity-40">
                   {busy && <LoaderCircle size={14} className="animate-spin" />} Continue
