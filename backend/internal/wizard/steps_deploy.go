@@ -100,6 +100,19 @@ func (Deploy) Execute(ctx *RunContext) error {
 		return nil
 	}
 
+	// connect_alpaca (Hangar 3) writes the product's credentials to
+	// products/<name>/.env — but compose up runs from the clone dir, so the
+	// product's own docker-compose.yml (if it declares env_file: .env) can't
+	// see them unless we carry the file over. Best-effort: some products may
+	// not use Alpaca creds at all, so a missing source file isn't fatal here.
+	envSrc := ctx.RepoRoot + "/products/" + ctx.Run.ProductName + "/.env"
+	if data, err := os.ReadFile(envSrc); err == nil {
+		if err := os.WriteFile(dir+"/.env", data, 0o600); err != nil {
+			ctx.State["deploy_error"] = "copying product .env into deploy dir: " + err.Error()
+			return nil
+		}
+	}
+
 	if out, err := orchestrator.ComposeUp(dir, orchestrator.ComposeFiles(dir)...); err != nil {
 		ctx.State["deploy_error"] = fmt.Sprintf("%v — %s", err, out)
 		return nil
