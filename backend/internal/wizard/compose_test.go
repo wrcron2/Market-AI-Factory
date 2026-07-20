@@ -260,3 +260,74 @@ func TestWriteFactoryComposeProducesValidYAML(t *testing.T) {
 		t.Fatalf("generated file is not valid YAML: %v", err)
 	}
 }
+
+// Mirrors the real nof1.ai onboarding failure: mem_limit/memswap_limit both
+// set to 200m, below the floor, gets OOM-killed even with 21GB free on the
+// host — both must be raised together, since Docker rejects
+// memswap_limit < mem_limit.
+func TestRemapRaisesMemoryLimitBelowFloor(t *testing.T) {
+	path := writeComposeFixture(t, "services:\n  app:\n    image: some/app\n    mem_limit: 200m\n    memswap_limit: 200m\n")
+	res, err := remapPublishedPorts(path, 10100, "nof1-ai")
+	if err != nil {
+		t.Fatalf("remap: %v", err)
+	}
+	svc := res.Doc["services"].(map[string]any)["app"].(map[string]any)
+	if svc["mem_limit"] != memoryFloorBytes {
+		t.Fatalf("expected mem_limit raised to floor %d, got %v", memoryFloorBytes, svc["mem_limit"])
+	}
+	if svc["memswap_limit"] != memoryFloorBytes {
+		t.Fatalf("expected memswap_limit raised to match, got %v", svc["memswap_limit"])
+	}
+}
+
+// A product that already provisioned generously must be left alone — the
+// floor only raises, it never second-guesses a limit that already clears it.
+func TestRemapDoesNotLowerMemoryLimitAboveFloor(t *testing.T) {
+	path := writeComposeFixture(t, "services:\n  app:\n    image: some/app\n    mem_limit: 2g\n")
+	res, err := remapPublishedPorts(path, 10100, "generous-product")
+	if err != nil {
+		t.Fatalf("remap: %v", err)
+	}
+	svc := res.Doc["services"].(map[string]any)["app"].(map[string]any)
+	if svc["mem_limit"] != "2g" {
+		t.Fatalf("expected mem_limit left untouched at 2g, got %v", svc["mem_limit"])
+	}
+}
+
+// Most repos declare no mem_limit at all — unlimited already clears any
+// floor, so the floor must never introduce a cap where the author set none.
+func TestRemapDoesNotAddMemoryLimitWhenAbsent(t *testing.T) {
+	path := writeComposeFixture(t, "services:\n  app:\n    image: some/app\n")
+	res, err := remapPublishedPorts(path, 10100, "no-limit-product")
+	if err != nil {
+		t.Fatalf("remap: %v", err)
+	}
+	svc := res.Doc["services"].(map[string]any)["app"].(map[string]any)
+	if _, ok := svc["mem_limit"]; ok {
+		t.Fatalf("expected no mem_limit to be introduced, got %v", svc["mem_limit"])
+	}
+}
+
+func TestParseMemBytes(t *testing.T) {
+	cases := []struct {
+		in     any
+		want   int64
+		wantOK bool
+	}{
+		{"200m", 200 * 1024 * 1024, true},
+		{"1g", 1024 * 1024 * 1024, true},
+		{"512mb", 512 * 1024 * 1024, true},
+		{"1024k", 1024 * 1024, true},
+		{"209715200", 209715200, true},
+		{209715200, 209715200, true},
+		{float64(209715200), 209715200, true},
+		{"not-a-limit", 0, false},
+		{nil, 0, false},
+	}
+	for _, c := range cases {
+		got, ok := parseMemBytes(c.in)
+		if ok != c.wantOK || (ok && got != c.want) {
+			t.Errorf("parseMemBytes(%v) = (%d, %v), want (%d, %v)", c.in, got, ok, c.want, c.wantOK)
+		}
+	}
+}

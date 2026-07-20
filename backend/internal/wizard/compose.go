@@ -5,6 +5,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -54,6 +55,79 @@ type remapResult struct {
 // because the host side gets replaced outright, never merged.
 var containerPortRe = regexp.MustCompile(`:(\d+)(?:/(tcp|udp))?$`)
 
+// memoryFloorBytes is the minimum mem_limit the Factory enforces on every
+// onboarded product. Some repos under-provision for whatever host they were
+// authored against and get OOM-killed here even with headroom to spare — the
+// nof1.ai onboarding hit this exactly: its own docker-compose.yml sets
+// mem_limit: 200m, and the kernel killed it within seconds of every start
+// (dmesg: "Memory cgroup out of memory") despite 21GB free on the box. Only
+// ever raises an explicit limit below this floor — never lowers one, and
+// never adds a limit where none existed (unlimited already clears any floor).
+const memoryFloorBytes int64 = 512 * 1024 * 1024 // 512m
+
+// memUnitRe parses a compose mem_limit-style value: a bare byte count, or a
+// number followed by an optional b/k/m/g unit (with an optional trailing
+// "b", e.g. "512mb") — the forms docker-compose itself accepts.
+var memUnitRe = regexp.MustCompile(`(?i)^(\d+)\s*([bkmg]?)b?$`)
+
+// parseMemBytes converts a compose mem_limit/memswap_limit value (YAML may
+// hand back an int, float64, or string depending on how it was written) into
+// bytes. ok is false for anything it doesn't recognize — callers must leave
+// those values untouched rather than guess and risk corrupting a value the
+// product author set deliberately.
+func parseMemBytes(v any) (bytes int64, ok bool) {
+	switch t := v.(type) {
+	case int:
+		return int64(t), true
+	case int64:
+		return t, true
+	case float64:
+		return int64(t), true
+	case string:
+		m := memUnitRe.FindStringSubmatch(strings.TrimSpace(t))
+		if m == nil {
+			return 0, false
+		}
+		n, err := strconv.ParseInt(m[1], 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		switch strings.ToLower(m[2]) {
+		case "k":
+			return n * 1024, true
+		case "m":
+			return n * 1024 * 1024, true
+		case "g":
+			return n * 1024 * 1024 * 1024, true
+		default:
+			return n, true
+		}
+	default:
+		return 0, false
+	}
+}
+
+// raiseMemoryFloor enforces memoryFloorBytes on a service's mem_limit, and
+// keeps memswap_limit in step — Docker rejects memswap_limit < mem_limit, so
+// a paired limit below the floor is raised to match rather than left to
+// break compose up outright.
+func raiseMemoryFloor(svc map[string]any) {
+	raw, ok := svc["mem_limit"]
+	if !ok {
+		return // no limit declared — unlimited already satisfies any floor
+	}
+	b, ok := parseMemBytes(raw)
+	if !ok || b >= memoryFloorBytes {
+		return
+	}
+	svc["mem_limit"] = memoryFloorBytes
+	if swapRaw, ok := svc["memswap_limit"]; ok {
+		if swapB, ok := parseMemBytes(swapRaw); ok && swapB < memoryFloorBytes {
+			svc["memswap_limit"] = memoryFloorBytes
+		}
+	}
+}
+
 func extractContainerPort(entry string) (port, proto string, ok bool) {
 	if !strings.Contains(entry, ":") {
 		return "", "", false // bare "6379" — no fixed host port, nothing to remap
@@ -75,14 +149,19 @@ func extractContainerPort(entry string) (port, proto string, ok bool) {
 //     <productSlug>-net;
 //  3. gives every service a stable, globally-unique container_name
 //     (<productSlug>-<service>) and attaches it to the shared FactoryNetwork
-//     alongside its own private network.
+//     alongside its own private network;
+//  4. raises any mem_limit below memoryFloorBytes up to the floor (never
+//     lowers one, never adds one where none existed).
 //
 // (1) and (2) are real collisions, not hypothetical: Market-AI's own compose
 // file hardcodes both its ports and its network name ("marketflow-net"), so
 // any product forked from a similarly-shaped repo would otherwise fight over
 // one or the other. (3) is what makes the product reachable by the Factory
 // for health checks without a published host port or any cloud firewall
-// rule — internal Docker DNS, live the instant the container starts.
+// rule — internal Docker DNS, live the instant the container starts. (4) is
+// real too, not hypothetical: nof1.ai's own compose file caps itself at
+// 200m and gets OOM-killed on this box within seconds of every start, despite
+// 21GB free — see memoryFloorBytes.
 //
 // The doc is rewritten wholesale (not layered as a docker-compose.override.yml)
 // because compose CONCATENATES `ports:` lists across -f files rather than
@@ -136,6 +215,7 @@ func remapPublishedPorts(composeFile string, base int, productSlug string) (*rem
 		res.ContainerNames[name] = containerName
 		svc["container_name"] = containerName
 		svc["networks"] = attachFactoryNetwork(svc["networks"])
+		raiseMemoryFloor(svc)
 
 		portsRaw, _ := svc["ports"].([]any)
 		if len(portsRaw) > 0 {
