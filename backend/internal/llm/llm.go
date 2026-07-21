@@ -45,13 +45,19 @@ var KnownModels = []string{
 
 // Call sends system+user to the provider behind uiModel and returns the reply
 // plus a human-readable provider tag for logging (e.g. "Groq llama-3.3-70b").
-// Groq-backed models fall back to local Ollama when the key is missing or the
-// call fails, matching Ask AI behavior.
+// Groq- and Claude-backed models fall back to local Ollama when the key is
+// missing or the call fails, matching Ask AI behavior.
 func (c *Client) Call(uiModel, system, user string) (reply, provider string, err error) {
 	switch uiModel {
 	case ModelClaudeSonnet:
-		reply, err = c.callClaude(system, user)
-		return reply, "Anthropic claude-sonnet-4-6", err
+		if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
+			reply, err = c.callClaude(system, user)
+			if err == nil {
+				return reply, "Anthropic claude-sonnet-4-6", nil
+			}
+		}
+		reply, err = c.callOllama("deepseek-r1:7b", system, user)
+		return reply, "Ollama deepseek-r1:7b (fallback)", err
 
 	case ModelDeepSeekGroq, ModelQwenGroq:
 		if key := os.Getenv("GROQ_API_KEY"); key != "" {
