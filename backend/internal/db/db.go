@@ -24,6 +24,9 @@ func Open(dsn string) (*DB, error) {
 	if _, err := conn.Exec(schema); err != nil {
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	if err := applyMigrations(conn); err != nil {
+		return nil, fmt.Errorf("apply migrations: %w", err)
+	}
 	if _, err := conn.Exec(scoutSchema); err != nil {
 		return nil, fmt.Errorf("apply scout schema: %w", err)
 	}
@@ -31,6 +34,48 @@ func Open(dsn string) (*DB, error) {
 		return nil, fmt.Errorf("apply reports schema: %w", err)
 	}
 	return &DB{conn: conn}, nil
+}
+
+// applyMigrations brings an existing database up to the current schema.
+// Each migration is idempotent and checks pragma_table_info before
+// ALTERing, so a fresh DB (which already has the columns from `schema`)
+// is a no-op and an old DB gets the missing columns added in place.
+// SQLite ALTER TABLE ADD COLUMN can't be wrapped in IF NOT EXISTS, so
+// the pragma query is the gate.
+func applyMigrations(conn *sql.DB) error {
+	type col struct{ name, ctype string }
+	productsColumns := make(map[string]string)
+	rows, err := conn.Query(`PRAGMA table_info(products)`)
+	if err != nil {
+		return fmt.Errorf("pragma products: %w", err)
+	}
+	for rows.Next() {
+		var cid int
+		var c col
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &c.name, &c.ctype, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		productsColumns[c.name] = c.ctype
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if _, ok := productsColumns["dashboard_auth_login"]; !ok {
+		if _, err := conn.Exec(`ALTER TABLE products ADD COLUMN dashboard_auth_login TEXT`); err != nil {
+			return fmt.Errorf("add dashboard_auth_login: %w", err)
+		}
+	}
+	if _, ok := productsColumns["dashboard_auth_token"]; !ok {
+		if _, err := conn.Exec(`ALTER TABLE products ADD COLUMN dashboard_auth_token TEXT`); err != nil {
+			return fmt.Errorf("add dashboard_auth_token: %w", err)
+		}
+	}
+	return nil
 }
 
 func (d *DB) Close() error { return d.conn.Close() }
@@ -47,31 +92,35 @@ const (
 )
 
 type Product struct {
-	ID           int64   `json:"id"`
-	Name         string  `json:"name"` // slug, unique
-	DisplayName  string  `json:"display_name"`
-	SourceRepo   string  `json:"source_repo"`
-	SourceSHA    string  `json:"source_sha,omitempty"`
-	Status       string  `json:"status"`
-	PortBase     int     `json:"port_base"`               // 0 = adopted product with its own ports
-	BudgetUSD    float64 `json:"budget_usd"`
-	DashboardURL string  `json:"dashboard_url,omitempty"` // product's own UI
-	HealthURL    string  `json:"health_url,omitempty"`    // probed by the monitor
-	AlpacaKeyID  string  `json:"alpaca_key_id,omitempty"` // key id only — secret never stored here
-	Adopted      bool    `json:"adopted"`                 // true = pre-existing deploy (Market-AI)
-	CreatedAt    string  `json:"created_at"`
-	UpdatedAt    string  `json:"updated_at"`
+	ID                 int64   `json:"id"`
+	Name               string  `json:"name"` // slug, unique
+	DisplayName        string  `json:"display_name"`
+	SourceRepo         string  `json:"source_repo"`
+	SourceSHA          string  `json:"source_sha,omitempty"`
+	Status             string  `json:"status"`
+	PortBase           int     `json:"port_base"` // 0 = adopted product with its own ports
+	BudgetUSD          float64 `json:"budget_usd"`
+	DashboardURL       string  `json:"dashboard_url,omitempty"`        // product's own UI
+	DashboardAuthLogin string  `json:"dashboard_auth_login,omitempty"` // path the proxy POSTs the token to (default /api/auth/login)
+	DashboardAuthToken string  `json:"-"`                              // secret the proxy trades for a session cookie at DashboardAuthLogin
+	HealthURL          string  `json:"health_url,omitempty"`           // probed by the monitor
+	AlpacaKeyID        string  `json:"alpaca_key_id,omitempty"`        // key id only — secret never stored here
+	Adopted            bool    `json:"adopted"`                        // true = pre-existing deploy (Market-AI)
+	CreatedAt          string  `json:"created_at"`
+	UpdatedAt          string  `json:"updated_at"`
 }
 
 func (d *DB) InsertProduct(p *Product) (int64, error) {
 	res, err := d.conn.Exec(`
 		INSERT INTO products (name, display_name, source_repo, source_sha, status,
-		                      port_base, budget_usd, dashboard_url, health_url,
-		                      alpaca_key_id, adopted)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		                      port_base, budget_usd, dashboard_url,
+		                      dashboard_auth_login, dashboard_auth_token,
+		                      health_url, alpaca_key_id, adopted)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		p.Name, p.DisplayName, p.SourceRepo, p.SourceSHA, p.Status,
-		p.PortBase, p.BudgetUSD, p.DashboardURL, p.HealthURL,
-		p.AlpacaKeyID, boolToInt(p.Adopted))
+		p.PortBase, p.BudgetUSD, p.DashboardURL,
+		p.DashboardAuthLogin, p.DashboardAuthToken,
+		p.HealthURL, p.AlpacaKeyID, boolToInt(p.Adopted))
 	if err != nil {
 		return 0, err
 	}
@@ -94,12 +143,14 @@ func (d *DB) UpdateProductStatus(name, status string) error {
 func (d *DB) UpdateProduct(p *Product) error {
 	res, err := d.conn.Exec(`
 		UPDATE products SET display_name=?, source_repo=?, source_sha=?, status=?,
-		       port_base=?, budget_usd=?, dashboard_url=?, health_url=?,
-		       alpaca_key_id=?, adopted=?, updated_at=datetime('now')
+		       port_base=?, budget_usd=?, dashboard_url=?,
+		       dashboard_auth_login=?, dashboard_auth_token=?,
+		       health_url=?, alpaca_key_id=?, adopted=?, updated_at=datetime('now')
 		WHERE name=?`,
 		p.DisplayName, p.SourceRepo, p.SourceSHA, p.Status,
-		p.PortBase, p.BudgetUSD, p.DashboardURL, p.HealthURL,
-		p.AlpacaKeyID, boolToInt(p.Adopted), p.Name)
+		p.PortBase, p.BudgetUSD, p.DashboardURL,
+		p.DashboardAuthLogin, p.DashboardAuthToken,
+		p.HealthURL, p.AlpacaKeyID, boolToInt(p.Adopted), p.Name)
 	if err != nil {
 		return err
 	}
@@ -143,7 +194,9 @@ func (d *DB) MaxPortBase() (int, error) {
 
 const productSelect = `
 	SELECT id, name, display_name, source_repo, COALESCE(source_sha,''), status,
-	       port_base, budget_usd, COALESCE(dashboard_url,''), COALESCE(health_url,''),
+	       port_base, budget_usd, COALESCE(dashboard_url,''),
+	       COALESCE(dashboard_auth_login,''), COALESCE(dashboard_auth_token,''),
+	       COALESCE(health_url,''),
 	       COALESCE(alpaca_key_id,''), adopted, created_at, updated_at
 	FROM products`
 
@@ -153,7 +206,9 @@ func scanProduct(r rowScanner) (*Product, error) {
 	var p Product
 	var adopted int
 	err := r.Scan(&p.ID, &p.Name, &p.DisplayName, &p.SourceRepo, &p.SourceSHA,
-		&p.Status, &p.PortBase, &p.BudgetUSD, &p.DashboardURL, &p.HealthURL,
+		&p.Status, &p.PortBase, &p.BudgetUSD, &p.DashboardURL,
+		&p.DashboardAuthLogin, &p.DashboardAuthToken,
+		&p.HealthURL,
 		&p.AlpacaKeyID, &adopted, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return nil, err
@@ -350,6 +405,8 @@ CREATE TABLE IF NOT EXISTS products (
     port_base     INTEGER NOT NULL DEFAULT 0,
     budget_usd    REAL NOT NULL DEFAULT 0,
     dashboard_url TEXT,
+    dashboard_auth_login TEXT,
+    dashboard_auth_token TEXT,
     health_url    TEXT,
     alpaca_key_id TEXT,
     adopted       INTEGER NOT NULL DEFAULT 0,

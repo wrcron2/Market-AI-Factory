@@ -19,10 +19,17 @@ type Handler struct {
 	logger   *zap.Logger
 	metrics  *MetricsProvider
 	workRoot string // where non-adopted product stacks live (compose dirs)
+	sessions *sessionCache
 }
 
 func New(database *db.DB, logger *zap.Logger, metrics *MetricsProvider, workRoot string) *Handler {
-	return &Handler{db: database, logger: logger, metrics: metrics, workRoot: workRoot}
+	return &Handler{
+		db:       database,
+		logger:   logger,
+		metrics:  metrics,
+		workRoot: workRoot,
+		sessions: newSessionCache(logger),
+	}
 }
 
 // productView is a Product enriched with live Alpaca metrics for the cards.

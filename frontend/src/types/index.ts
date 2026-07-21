@@ -15,6 +15,7 @@ export interface Product {
   port_base: number
   budget_usd: number
   dashboard_url?: string
+  dashboard_auth_login?: string
   health_url?: string
   alpaca_key_id?: string
   adopted: boolean

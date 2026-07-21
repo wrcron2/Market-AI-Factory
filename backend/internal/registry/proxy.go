@@ -3,11 +3,14 @@ package registry
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -120,6 +123,13 @@ func (h *Handler) ServeProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
+	// Resolve the product's upstream session cookie (best-effort auto-
+	// login). OpenAlice and similar products gate the dashboard behind
+	// a token-exchange login; the proxy caches the session per product
+	// and injects it into the request's Cookie header so the human
+	// never sees the product's own login wall. No-op when the product
+	// has no DashboardAuthToken.
+	sessionCookie := h.sessions.cookieFor(name, p, upstream)
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
@@ -130,6 +140,26 @@ func (h *Handler) ServeProxy(w http.ResponseWriter, r *http.Request) {
 		// specific Host would otherwise see "129.159.146.157:9080" and
 		// reject or set cookies for the wrong origin.
 		req.Host = upstream.Host
+		// Inject the upstream session cookie (best-effort: empty when
+		// the product has no auth token OR when login is in backoff).
+		// Merge with any browser-sent cookies the human may have
+		// already for this proxy host — but in practice the browser
+		// won't have an upstream-named cookie (Set-Cookie's Domain was
+		// stripped upstream so it was set for the Factory's host, not
+		// the upstream), so we just set rather than append.
+		if sessionCookie != "" {
+			// The Factory's cached session cookie is authoritative. Merge
+			// it over any cookies the browser sent, dropping any stale copy
+			// of the SAME name: because the base proxy strips Set-Cookie
+			// Domain, the browser stores the upstream's session cookie under
+			// the Factory's host and sends it back here — a value that can
+			// go stale (server-side expiry) while the browser keeps it. If
+			// that stale copy rode alongside ours, a first-match upstream
+			// (Koa's cookie parser) would keep using it and the cache's
+			// re-login could never take hold: a permanent 401 loop. Other
+			// browser cookies (theme, etc.) are preserved.
+			req.Header.Set("Cookie", mergeSessionCookie(req.Header.Get("Cookie"), sessionCookie))
+		}
 		// X-Forwarded-* and friends are deleted in the Transport below,
 		// NOT here — ReverseProxy.ServeHTTP re-adds X-Forwarded-For
 		// from RemoteAddr AFTER the Director runs, so a Director-side
@@ -144,6 +174,17 @@ func (h *Handler) ServeProxy(w http.ResponseWriter, r *http.Request) {
 	// Factory's hostname, or the upstream's scheme via these hints.
 	proxy.Transport = &forwardingHeaderStripper{base: http.DefaultTransport}
 	proxy.ModifyResponse = func(resp *http.Response) error {
+		// Session-expiry signal: if upstream returns 401/403 while we
+		// had a session cookie in flight, the cached cookie is stale
+		// (or the product rotated it). Invalidate the cache entry so
+		// the next request re-logs in. We don't retry here — the
+		// human's browser would still see the 401 page, but a Reload
+		// (or just navigating to another dashboard route) triggers a
+		// fresh login. This keeps the cache self-healing without
+		// adding latency on the warm path.
+		if sessionCookie != "" && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+			h.sessions.invalidate(name)
+		}
 		// Rewrite Location: headers on 3xx so a redirect to the
 		// upstream's own URL stays routed back through the proxy.
 		// e.g. upstream returns "Location: http://openalice:47331/login"
@@ -280,7 +321,9 @@ func targetFor(p *db.Product, subPath string) (*url.URL, error) {
 // "/open-alice/proxy/"           -> ("open-alice", "",             true)
 // "/open-alice/proxy/login"      -> ("open-alice", "login",        true)
 // "/open-alice/proxy/a/b?c=1"   -> ("open-alice", "a/b",          true)
-//                                  (the query string is on r.URL, not in rest)
+//
+//	(the query string is on r.URL, not in rest)
+//
 // "/market-ai/pause"             -> not a proxy route; (..., false)
 func splitProxyPath(rest string) (name, subPath string, ok bool) {
 	parts := strings.SplitN(rest, "/", 3)
@@ -362,6 +405,43 @@ func stripCookieDomain(c string) string {
 	return strings.Join(kept, ";")
 }
 
+// mergeSessionCookie combines the browser-sent Cookie header (existing) with
+// the Factory's authoritative session cookie (session, a "name=value" pair),
+// so the upstream receives exactly ONE value for the session cookie — ours.
+// Any cookie in existing whose name matches the session cookie's name is
+// dropped: it's a stale copy the browser accumulated because the base proxy
+// strips Set-Cookie Domain (so the upstream's cookie gets stored under the
+// Factory's host and sent back here). All other browser cookies are preserved
+// in order and the session cookie is appended last. Empty existing yields just
+// the session cookie. Cookie names are matched case-sensitively per RFC 6265.
+func mergeSessionCookie(existing, session string) string {
+	if existing == "" {
+		return session
+	}
+	name := session
+	if i := strings.IndexByte(session, '='); i >= 0 {
+		name = session[:i]
+	}
+	parts := strings.Split(existing, ";")
+	kept := make([]string, 0, len(parts)+1)
+	for _, part := range parts {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		cookieName := p
+		if i := strings.IndexByte(p, '='); i >= 0 {
+			cookieName = p[:i]
+		}
+		if cookieName == name {
+			continue // drop the browser's (possibly stale) same-named copy
+		}
+		kept = append(kept, p)
+	}
+	kept = append(kept, session)
+	return strings.Join(kept, "; ")
+}
+
 // forwardingHeaderStripper wraps a RoundTripper and removes every
 // forwarding-identifying header from the outgoing request before it
 // reaches the wire. This is the only reliable place to strip them:
@@ -396,6 +476,187 @@ func (f *forwardingHeaderStripper) RoundTrip(req *http.Request) (*http.Response,
 		req2.Header.Del(h)
 	}
 	return f.base.RoundTrip(req2)
+}
+
+// ─── Per-product session cache (auto-login) ──────────────────────────────────
+
+// sessionCache holds one upstream session cookie per product, keyed by
+// product name. When a product declares DashboardAuthToken, the proxy
+// trades that token for a session cookie at DashboardAuthLogin (default
+// /api/auth/login) on the first proxied request, then injects the
+// cookie into every subsequent proxied request for that product — so
+// the human never sees the product's own login wall. The cached cookie
+// has a short TTL (default 1h): if it expires or the upstream starts
+// 401ing, the proxy re-logs-in transparently.
+//
+// Security model:
+//   - The token lives in the Factory's DB; it never reaches the
+//     browser, never appears in logs, and is only sent to the upstream
+//     over the internal Docker network (the proxy calls the upstream
+//     directly, not the browser).
+//   - The session cookie is per-product and lives only in the proxy's
+//     process memory; it's not written to disk anywhere.
+//   - On Factory restart, the cache is cold; the first request for
+//     each product re-triggers a login. No state to migrate.
+//   - The cache is bounded by the number of LIVE products with a
+//     DashboardAuthToken, which is a single-digit number in practice.
+//
+// OpenAlice (the reference product this was built for) accepts
+// POST /api/auth/login with {"token":"<first-run admin token>"} and
+// returns Set-Cookie: alice_session=<opaque>; Max-Age=604799. The
+// proxy extracts the first Set-Cookie value as the session cookie —
+// it doesn't care what the cookie's name is, just that one exists.
+//
+// Other auth-shaped products: the default login path is /api/auth/login
+// and the default request body is {"token":"<value>"}. Products with a
+// different shape can set dashboard_auth_login to override the path;
+// body shape is fixed (extending it to a template would be a future
+// improvement, YAGNI until we have a second product that needs it).
+type sessionCache struct {
+	logger *zap.Logger
+	mu     sync.Mutex
+	chars  map[string]cachedSession // product name → session
+}
+
+type cachedSession struct {
+	cookie    string // raw "name=value" cookie pair, e.g. "alice_session=abc123"
+	expiresAt time.Time
+	// loginFailedAt, if non-zero, records the last time a login attempt
+	// failed. While backoff is in effect (loginBackoff window), new
+	// requests for the session skip the login attempt and just forward
+	// without a cookie — a misconfigured token shouldn't take the proxy
+	// down or hammer the upstream with retries.
+	loginFailedAt time.Time
+}
+
+// loginBackoff gates how often the cache will retry a failed login for
+// a given product. Generous because the operator fixes the token in the
+// wizard, not by poking the cache.
+const loginBackoff = 5 * time.Minute
+
+// sessionTTL bounds how long a cached cookie is trusted. OpenAlice's
+// session is 7 days, but the proxy doesn't peek at Max-Age — a single
+// TTL for everything is simpler and keeps the cache from going stale
+// across long-running products. The cookie is revalidated lazily: if
+// the upstream starts returning 401, the proxy re-logs in.
+const sessionTTL = 1 * time.Hour
+
+// loginClient times out the upstream login probe — a slow upstream
+// login shouldn't hang the human's browser request. The login is
+// best-effort (we fall back to proxying without a cookie if it fails),
+// so a 5s budget is plenty.
+var loginClient = &http.Client{Timeout: 5 * time.Second}
+
+func newSessionCache(logger *zap.Logger) *sessionCache {
+	return &sessionCache{logger: logger, chars: make(map[string]cachedSession)}
+}
+
+// cookieFor returns the cached session cookie for productName, doing
+// a fresh login if the cache is cold, expired, or marked for re-login.
+// Returns "" when the product has no token, when login fails, or when
+// the cache is in backoff after a recent failure — in all those cases
+// the proxy simply forwards the request without a session cookie (the
+// upstream will likely 401, but the human's browser then sees the
+// product's own "invalid session" UI rather than the Factory hanging).
+func (c *sessionCache) cookieFor(productName string, p *db.Product, upstream *url.URL) string {
+	if p.DashboardAuthToken == "" {
+		return ""
+	}
+	c.mu.Lock()
+	cached, ok := c.chars[productName]
+	c.mu.Unlock()
+	if ok && time.Now().Before(cached.expiresAt) && cached.cookie != "" {
+		return cached.cookie
+	}
+	// Backoff: don't retry a failing login more often than loginBackoff.
+	// This keeps a misconfigured token from drowning the upstream in
+	// POSTs while the operator investigates.
+	if ok && cached.cookie == "" && !cached.loginFailedAt.IsZero() && time.Since(cached.loginFailedAt) < loginBackoff {
+		return ""
+	}
+	cookie, ok := c.login(productName, p, upstream)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ok {
+		c.chars[productName] = cachedSession{cookie: cookie, expiresAt: time.Now().Add(sessionTTL)}
+		return cookie
+	}
+	// Record the failure so backoff kicks in. A previous good cookie is
+	// wiped — we don't want to re-use a cookie we already doubt.
+	c.chars[productName] = cachedSession{loginFailedAt: time.Now()}
+	return ""
+}
+
+// invalidate forces a re-login on the next request — called when the
+// upstream returns 401/403 on a request we previously had a cookie for.
+// If the upstream is strict and the cookie was minted wrong, the next
+// request re-logs in; if login is also failing, backoff governs.
+func (c *sessionCache) invalidate(productName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.chars[productName]; ok {
+		delete(c.chars, productName)
+	}
+}
+
+// login POSTs the product's token to its DashboardAuthLogin path on
+// the upstream and returns the first Set-Cookie value as "name=value".
+// On any failure (non-2xx, no Set-Cookie, network error) it returns
+// (_, false) and the caller records the failure for backoff.
+func (c *sessionCache) login(productName string, p *db.Product, upstream *url.URL) (string, bool) {
+	loginPath := p.DashboardAuthLogin
+	if loginPath == "" {
+		loginPath = "/api/auth/login"
+	}
+	// Build the login URL from the upstream's scheme/host so the request
+	// is always same-origin with the dashboard the proxy is forwarding
+	// to — a product that holds the session cookie to a specific Host
+	// (OpenAlice's Koa session does) gets the right one.
+	loginURL := *upstream
+	loginURL.Path = loginPath
+	loginURL.RawPath = ""
+	loginURL.RawQuery = ""
+	loginURL.Fragment = ""
+	body := fmt.Sprintf(`{"token":%q}`, p.DashboardAuthToken)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, loginURL.String(), strings.NewReader(body))
+	if err != nil {
+		c.logger.Warn("proxy.login_build_failed",
+			zap.String("product", productName), zap.Error(err))
+		return "", false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Host = upstream.Host // product app ties session to its own Host
+	resp, err := loginClient.Do(req)
+	if err != nil {
+		c.logger.Warn("proxy.login_request_failed",
+			zap.String("product", productName), zap.Error(err))
+		return "", false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		c.logger.Warn("proxy.login_non_2xx",
+			zap.String("product", productName), zap.Int("status", resp.StatusCode))
+		return "", false
+	}
+	// Extract the first Set-Cookie's name=value pair. We don't parse
+	// attributes (Path/Domain/HttpOnly/etc.) because we're going to
+	// re-inject this as a Cookie header value ourselves — the upstream's
+	// attribute decisions don't apply to a synthetic Cookie header on a
+	// different request.
+	for _, sc := range resp.Header.Values("Set-Cookie") {
+		// Set-Cookie is "name=value; Attr=val; ...". The pair is the
+		// first chunk before any ";". Trim whitespace just in case.
+		if i := strings.IndexByte(sc, ';'); i >= 0 {
+			sc = sc[:i]
+		}
+		sc = strings.TrimSpace(sc)
+		if sc != "" && strings.Contains(sc, "=") {
+			return sc, true
+		}
+	}
+	c.logger.Warn("proxy.login_no_set_cookie", zap.String("product", productName))
+	return "", false
 }
 
 // (no EOF marker — file ends here)

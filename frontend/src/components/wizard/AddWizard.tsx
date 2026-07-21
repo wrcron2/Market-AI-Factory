@@ -34,12 +34,26 @@ interface Run {
   status: 'running' | 'blocked' | 'done' | 'failed' | 'cancelled'
 }
 
-const INPUT_LABELS: Record<string, { label: string; secret?: boolean; placeholder?: string }> = {
+const INPUT_LABELS: Record<string, { label: string; secret?: boolean; placeholder?: string; hint?: string }> = {
   alpaca_key_id: { label: 'Alpaca API key ID', placeholder: 'PK…' },
   alpaca_secret: { label: 'Alpaca API secret', secret: true },
   budget_usd: { label: 'Budget (USD)', placeholder: '10000' },
-  dashboard_url: { label: 'Existing dashboard URL (adopted products)', placeholder: 'http://…' },
-  health_url: { label: 'Existing health URL (adopted products)', placeholder: 'http://…/api/health' },
+  dashboard_url: {
+    label: 'Dashboard URL',
+    placeholder: 'http://openalice:47331/ — internal Docker URL preferred',
+    hint: 'Paste the internal_url from the hint above. The proxy routes to this via Docker DNS — no host port or cloud firewall rule needed.',
+  },
+  health_url: {
+    label: 'Health URL',
+    placeholder: 'http://openalice:47331/ — internal Docker URL preferred',
+    hint: 'The liveness endpoint the monitor will probe. Use the internal_url; it works immediately with no firewall rule.',
+  },
+  dashboard_auth_token: {
+    label: 'Dashboard auth token (optional)',
+    secret: true,
+    placeholder: 'first-run admin token (e.g. OpenAlice’s bootstrap token)',
+    hint: 'If the dashboard sits behind a sign-in wall, paste the product\'s first-run admin token here — the Factory\'s reverse proxy logs in on your behalf and caches the session cookie in memory; you never see the login form.',
+  },
 }
 
 /** New-run form (/wizard/new) — also pre-fillable via query params, which the
@@ -247,6 +261,9 @@ export function WizardRun() {
                           onChange={(e) => setInputs((x) => ({ ...x, [f]: e.target.value }))}
                           className="mf-input"
                         />
+                        {spec.hint && (
+                          <span className="mt-1 text-[11px] leading-snug text-ink-faint">{spec.hint}</span>
+                        )}
                       </Field>
                     )
                   })}

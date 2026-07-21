@@ -3,8 +3,10 @@ package wizard
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -161,6 +163,12 @@ func (VerifyHealth) NeedsInput() []string {
 	// The deploy step only ever sets health_url on the adopted fast path
 	// (Bug: it silently dropped this for newly-cloned products). This step
 	// is where a new product's health_url actually gets captured.
+	//
+	// The dashboard auth token is deliberately NOT collected here — it's a
+	// secret, and this step persists its inputs into run state (which the
+	// run-status API serves verbatim). Secrets ride in Input to the step
+	// that consumes them, never into persisted State; the token is captured
+	// at Publish instead. See that step's NeedsInput.
 	return []string{"health_url", "dashboard_url"}
 }
 
@@ -192,7 +200,22 @@ func (VerifyHealth) Check(ctx *RunContext) []Issue {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
-		return []Issue{{Code: "health_unreachable", Message: err.Error(), Hint: "Is the product's stack running? Fix and Refresh."}}
+		// The health probe runs from the backend host's network
+		// namespace — it can reach internal Docker URLs (e.g.
+		// http://openalice:47331/) directly. If the URL is bad, a
+		// public IP that's blocked, or the stack isn't up yet, this
+		// surfaces it. Either way, the user gets an actionable hint.
+		hint := "Is the product's stack running? Fix and Refresh."
+		if pm, ok := ctx.State["port_map"].(map[string]any); ok && len(pm) > 0 {
+			parts := make([]string, 0, len(pm))
+			for svc, v := range pm {
+				entry, _ := v.(map[string]any)
+				parts = append(parts, fmt.Sprintf("%s → %v (published at host port %v)", svc, entry["internal_url"], entry["host_port"]))
+			}
+			sort.Strings(parts)
+			hint += " Prefer the internal_url — it works immediately, no firewall rule needed: " + strings.Join(parts, "; ") + "."
+		}
+		return []Issue{{Code: "health_unreachable", Message: err.Error(), Hint: hint}}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -206,9 +229,18 @@ func (VerifyHealth) Check(ctx *RunContext) []Issue {
 
 type Publish struct{}
 
-func (Publish) ID() string          { return "publish" }
-func (Publish) Title() string       { return "Publish product" }
-func (Publish) NeedsInput() []string { return nil }
+func (Publish) ID() string    { return "publish" }
+func (Publish) Title() string { return "Publish product" }
+
+// NeedsInput collects the dashboard auth token HERE (not at verify_health)
+// precisely because it's a secret. Every step persists its inputs into run
+// state, and the run-status API serves that state verbatim — so a secret
+// captured at an earlier step would be written to the DB scratchpad and
+// leaked back over the wire. Publish writes the token straight to the
+// product row (json:"-", never serialized) and never into State, mirroring
+// how alpaca_secret already flows through Input into the product's .env.
+// The field is optional: leave it blank for a public dashboard.
+func (Publish) NeedsInput() []string { return []string{"dashboard_auth_token"} }
 
 func (Publish) Execute(ctx *RunContext) error {
 	budget, _ := ctx.State["budget_usd"].(float64)
@@ -217,23 +249,71 @@ func (Publish) Execute(ctx *RunContext) error {
 		portBase = int(v)
 	}
 	adopted, _ := ctx.State["adopted"].(bool)
-	p := &db.Product{
-		Name:         ctx.Run.ProductName,
-		DisplayName:  ctx.Run.ProductName,
-		SourceRepo:   ctx.Run.SourceRepo,
-		SourceSHA:    ctx.StateStr("source_sha"),
-		Status:       db.StatusLive,
-		PortBase:     portBase,
-		BudgetUSD:    budget,
-		DashboardURL: ctx.StateStr("dashboard_url"),
-		HealthURL:    ctx.StateStr("health_url"),
-		AlpacaKeyID:  ctx.StateStr("alpaca_key_id"),
-		Adopted:      adopted,
+	dashboardURL := ctx.StateStr("dashboard_url")
+	healthURL := ctx.StateStr("health_url")
+	// The token is a write-only secret: it arrives via Input at this step
+	// and lands only in the product row. The login path it's POSTed to is
+	// non-secret and defaults to OpenAlice's shape; override via Input only
+	// for a differently-shaped product. Both are left as the raw Input here
+	// (possibly blank) — defaulting and preserve-on-blank happen once the
+	// existing row is known, below.
+	authToken := strings.TrimSpace(ctx.Input["dashboard_auth_token"])
+	authLogin := strings.TrimSpace(ctx.Input["dashboard_auth_login"])
+	// For non-adopted products, rewrite a public-IP host:port in the
+	// dashboard_url/health_url the human entered back to the internal
+	// container URL the deploy step recorded in port_map. This is the
+	// whole point of Plan B: the dashboard_url the proxy routes to
+	// should never need a published host port or a per-product cloud
+	// firewall rule — Docker DNS is enough. A user who copy-pastes the
+	// wizard's published-port hint into the field (which is a natural
+	// thing to do) would otherwise silently route via hairpin NAT, the
+	// failure mode that bit open-alice. Adopted products are exempt:
+	// their dashboard_url is pre-existing public infrastructure (e.g.
+	// market-ai's own nginx), the proxy just routes through it.
+	if !adopted {
+		if pm, ok := ctx.State["port_map"].(map[string]any); ok && len(pm) > 0 {
+			dashboardURL = rewriteToInternalURL(dashboardURL, pm)
+			healthURL = rewriteToInternalURL(healthURL, pm)
+		}
 	}
-	if existing, err := ctx.DB.GetProduct(p.Name); err == nil && existing != nil {
+	p := &db.Product{
+		Name:               ctx.Run.ProductName,
+		DisplayName:        ctx.Run.ProductName,
+		SourceRepo:         ctx.Run.SourceRepo,
+		SourceSHA:          ctx.StateStr("source_sha"),
+		Status:             db.StatusLive,
+		PortBase:           portBase,
+		BudgetUSD:          budget,
+		DashboardURL:       dashboardURL,
+		DashboardAuthLogin: authLogin,
+		DashboardAuthToken: authToken,
+		HealthURL:          healthURL,
+		AlpacaKeyID:        ctx.StateStr("alpaca_key_id"),
+		Adopted:            adopted,
+	}
+	existing, err := ctx.DB.GetProduct(p.Name)
+	isUpdate := err == nil && existing != nil
+	if isUpdate {
+		// Runs are replayable, so Publish can execute more than once. Both
+		// auth fields are optional: an empty Input here means "unchanged",
+		// not "clear it" — don't blank a value a prior run already stored.
+		if authToken == "" {
+			p.DashboardAuthToken = existing.DashboardAuthToken
+		}
+		if authLogin == "" {
+			p.DashboardAuthLogin = existing.DashboardAuthLogin
+		}
+	}
+	// Default the login path only when it's genuinely unset (fresh product,
+	// or an old row that predates the column) — never override a value the
+	// preserve-on-blank branch just carried forward.
+	if p.DashboardAuthLogin == "" {
+		p.DashboardAuthLogin = "/api/auth/login"
+	}
+	if isUpdate {
 		return ctx.DB.UpdateProduct(p)
 	}
-	_, err := ctx.DB.InsertProduct(p)
+	_, err = ctx.DB.InsertProduct(p)
 	return err
 }
 
@@ -248,3 +328,83 @@ func (Publish) Check(ctx *RunContext) []Issue {
 	return nil
 }
 
+// rewriteToInternalURL replaces a public-IP host:port in a URL with the
+// internal container URL recorded in port_map, when the URL's port
+// matches a port_map entry's host_port. The path/query/fragment are
+// preserved verbatim; only the host:port is swapped. Returns the input
+// unchanged when:
+//   - the URL is empty
+//   - the URL has no port (can't match anything)
+//   - the URL's port doesn't match any port_map host_port
+//   - the port_map is empty
+//   - the URL fails to parse (e.g. a malformed input)
+//
+// port_map shape (from Deploy.Execute):
+//
+//	{
+//	  "openalice:47331": {
+//	    "internal_url": "http://openalice:47331",
+//	    "host_port":    10100            // float64 from JSON round-trip
+//	  }
+//	}
+//
+// Example: "http://129.159.146.157:10100/login" →
+// "http://openalice:47331/login" when port_map has an entry whose host_port
+// is 10100.
+//
+// Defense in depth: even though the wizard records port_map from the
+// deploy step's own output, treat the port_map's internal_url as
+// untrusted — it's user-adjacent (the repo's compose file declared the
+// container port and name). Parse it; if it doesn't yield a clean
+// host:port, skip the rewrite and leave the original URL alone.
+func rewriteToInternalURL(raw string, portMap map[string]any) string {
+	if raw == "" || len(portMap) == 0 {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return raw
+	}
+	portStr := u.Port()
+	if portStr == "" {
+		// No port in the URL — can't match a host_port in port_map.
+		// (An internal Docker URL like http://openalice:47331/ already
+		// has a port; a public IP without a port is almost always :80
+		// or :443 which is never in the per-product port range anyway.)
+		return raw
+	}
+	hostPort, err := strconv.Atoi(portStr)
+	if err != nil {
+		return raw
+	}
+	for _, v := range portMap {
+		entry, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		hp, _ := entry["host_port"].(float64) // JSON round-trips ints as float64
+		if int(hp) != hostPort {
+			continue
+		}
+		internalURL, _ := entry["internal_url"].(string)
+		if internalURL == "" {
+			continue
+		}
+		iu, err := url.Parse(internalURL)
+		if err != nil || iu.Host == "" {
+			continue
+		}
+		// Adopt the internal_url's scheme AND host, not just the host:
+		// we're now targeting the internal Docker network, which speaks
+		// plain http. Keeping the operator's original scheme would turn
+		// a pasted "https://<public-ip>:<port>" into
+		// "https://<container>:<port>", and every later health probe and
+		// proxy hop would fail a TLS handshake against a plaintext
+		// container — a 502 the onboarding flow never surfaces because
+		// verify_health still checked the original public URL.
+		u.Scheme = iu.Scheme
+		u.Host = iu.Host
+		return u.String()
+	}
+	return raw
+}

@@ -83,6 +83,12 @@ misbehaves, roll back first, diagnose second — the market doesn't wait.
   their dashboards are reachable ONLY through the Factory proxy.
 - If a product's raw URL ever needs direct browser access (debugging),
   open a temporary OCI rule for its specific port, use it, then close it.
+- **Auth-gated dashboards** (e.g. OpenAlice): the proxy auto-logs-in using a
+  token stored in `products.dashboard_auth_token` (set at the wizard's Publish
+  step). The token is a write-only secret — API-omitted (`json:"-"`), never in
+  logs, never in the browser, never in wizard run state; the session cookie is
+  cached only in the backend's memory. Never echo it. See
+  `docs/dashboard-auth-proxy.md`.
 
 ## Boundaries
 - Code must already be on main — never push yourself.
